@@ -1,0 +1,65 @@
+"""Point-in-time social data contracts and storage."""
+
+from .domain import (
+    SOCIAL_SOURCE_SCHEMA_VERSION,
+    EngagementSnapshot,
+    SocialObservation,
+)
+from .adapter import social_observation_to_document
+from .ingestion import (
+    EntityResolver,
+    HttpResponse,
+    HttpStatusError,
+    HttpTransport,
+    KeywordEntityResolver,
+    LexiconSentimentScorer,
+    PersistedSocialIngestion,
+    RateLimitError,
+    RawEngagement,
+    RawSocialPost,
+    RedditJsonCollector,
+    RedditJsonParser,
+    SentimentScore,
+    SentimentScorer,
+    SocialCollector,
+    SocialIngestionBatch,
+    SocialIngestionIssue,
+    SocialIngestionOrchestrator,
+    SocialPayloadError,
+    SocialPayloadParser,
+    SocialTransportError,
+    UrllibHttpTransport,
+)
+from .store import InMemorySocialObservationStore, SocialStoreAppendResult
+
+
+__all__ = [
+    "EngagementSnapshot",
+    "EntityResolver",
+    "HttpResponse",
+    "HttpStatusError",
+    "HttpTransport",
+    "InMemorySocialObservationStore",
+    "KeywordEntityResolver",
+    "LexiconSentimentScorer",
+    "PersistedSocialIngestion",
+    "RateLimitError",
+    "RawEngagement",
+    "RawSocialPost",
+    "RedditJsonCollector",
+    "RedditJsonParser",
+    "SOCIAL_SOURCE_SCHEMA_VERSION",
+    "SentimentScore",
+    "SentimentScorer",
+    "SocialCollector",
+    "SocialIngestionBatch",
+    "SocialIngestionIssue",
+    "SocialIngestionOrchestrator",
+    "SocialObservation",
+    "social_observation_to_document",
+    "SocialPayloadError",
+    "SocialPayloadParser",
+    "SocialStoreAppendResult",
+    "SocialTransportError",
+    "UrllibHttpTransport",
+]
