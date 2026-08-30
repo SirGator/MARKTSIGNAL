@@ -37,16 +37,31 @@ def _build_parser() -> argparse.ArgumentParser:
     train_cmd.add_argument("--lr", type=float, default=3e-4, help="learning rate")
     train_cmd.add_argument("--max-seq-len", type=int, default=512)
     train_cmd.add_argument("--vocab-size", type=int, default=4000)
-    train_cmd.add_argument("--num-scenarios", type=int, default=5000, help="parametric scenarios")
+    train_cmd.add_argument("--num-scenarios", type=int, default=5000, help="parametric scenarios (legacy mode)")
     train_cmd.add_argument("--num-counter-groups", type=int, default=200)
     train_cmd.add_argument("--seed", type=int, default=42)
+    train_cmd.add_argument(
+        "--dataset",
+        type=Path,
+        default=None,
+        help="path to a frozen dataset directory (e.g. data/dataset_v1). "
+        "When set, train/validation/OOD splits are loaded from there instead "
+        "of generating parametric scenarios on the fly.",
+    )
     train_cmd.add_argument("--output", type=Path, default=Path(".model_checkpoints/economy_encoder_v1.pt"))
+    train_cmd.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=1,
+        metavar="EPOCHS",
+        help="save an inference-ready snapshot after every N epochs in each phase (default: 1)",
+    )
     train_cmd.add_argument("--skip-pretrain", action="store_true", help="skip MLM pretraining")
     train_cmd.add_argument("--device", default="auto", help="cpu | cuda | auto")
     train_cmd.add_argument("--log-every", type=int, default=50, help="log loss every N steps")
-    train_cmd.add_argument("--val-split", type=float, default=0.1, help="fraction held out for validation")
-    train_cmd.add_argument("--num-paraphrases", type=int, default=3, help="paraphrase variants per scenario")
-    train_cmd.add_argument("--neutralize-ratio", type=float, default=0.25, help="fraction with [NO_SUMMARY]")
+    train_cmd.add_argument("--val-split", type=float, default=0.1, help="fraction held out for validation (legacy mode)")
+    train_cmd.add_argument("--num-paraphrases", type=int, default=3, help="paraphrase variants per scenario (legacy mode)")
+    train_cmd.add_argument("--neutralize-ratio", type=float, default=0.25, help="fraction with [NO_SUMMARY] (legacy mode)")
     train_cmd.add_argument("--no-summary", action="store_true", help="ablation: replace ALL summaries with [NO_SUMMARY]")
 
     subcommands.add_parser("info", help="show training data statistics")
@@ -58,6 +73,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
 
     args = parser.parse_args(argv)
+
+    if args.command == "train" and args.checkpoint_every < 1:
+        parser.error("--checkpoint-every must be at least 1")
 
     if args.command == "info":
         scenarios = generate_parametric(num=100, seed=42)
@@ -85,10 +103,12 @@ def _training_config_from_args(
     args: argparse.Namespace,
     *,
     vocab_size: int,
+    frozen=None,
 ) -> TrainingConfig:
     """Build the persisted run config from the parsed CLI contract."""
     from .pipeline import TrainingConfig
 
+    manifest = None if frozen is None else frozen.manifest
     return TrainingConfig(
         model_dir=args.output.parent,
         vocab_size=vocab_size,
@@ -99,11 +119,40 @@ def _training_config_from_args(
         log_every=args.log_every,
         summary_mode=_summary_mode_from_args(args),
         seed=args.seed,
+        dataset_version=(
+            None if manifest is None else str(manifest["dataset_version"])
+        ),
+        dataset_schema_version=(
+            None if manifest is None else str(manifest["schema_version"])
+        ),
+        dataset_generator_version=(
+            None if manifest is None else str(manifest["generator_version"])
+        ),
+        dataset_seed=(None if manifest is None else int(manifest["seed"])),
     )
 
 
+def _periodic_checkpoint_path(
+    output: Path,
+    *,
+    phase: str,
+    completed_epochs: int,
+) -> Path:
+    """Build a stable snapshot path without replacing the final checkpoint."""
+
+    if phase not in {"pretrain", "score"}:
+        raise ValueError(f"unknown checkpoint phase: {phase!r}")
+    if isinstance(completed_epochs, bool) or not isinstance(completed_epochs, int):
+        raise TypeError("completed_epochs must be an integer")
+    if completed_epochs < 1:
+        raise ValueError("completed_epochs must be a positive integer")
+
+    checkpoint_dir = output.with_suffix(".checkpoints")
+    return checkpoint_dir / f"{phase}_epoch_{completed_epochs:03d}.pt"
+
+
 def _serialization_corpora(
-    scenarios: list[EconomicScenario],
+    scenarios: list[object],
     *,
     summary_mode: str,
 ) -> tuple[list[str], list[str]]:
@@ -111,11 +160,11 @@ def _serialization_corpora(
 
     mode = normalize_summary_mode(summary_mode)
     tokenizer_texts = [
-        serialize_scenario(scenario, summary_mode=SUMMARY_MODE_FULL)
+        _serialize_evaluation_example(scenario, summary_mode=SUMMARY_MODE_FULL)
         for scenario in scenarios
     ]
     model_texts = [
-        serialize_scenario(scenario, summary_mode=mode)
+        _serialize_evaluation_example(scenario, summary_mode=mode)
         for scenario in scenarios
     ]
     return tokenizer_texts, model_texts
@@ -147,6 +196,74 @@ def _encode_evaluation_text(model, tokenizer, text: str) -> list[int]:
     return token_ids
 
 
+def _load_training_data(args):
+    """Return (train_examples, val_examples, iid_test_examples, ood_splits) for one run.
+
+    When ``--dataset`` points at a frozen dataset directory, the splits are
+    loaded verbatim from there and the legacy parametric generator is
+    bypassed.  Otherwise the legacy on-the-fly generator is used, preserving
+    the existing behaviour for smoke tests and ablations that do not need a
+    frozen artifact.
+    """
+
+    summary_mode = _summary_mode_from_args(args)
+
+    if args.dataset is not None:
+        from .data import load_frozen_dataset_for_training
+
+        print(f"=== 1. Frozen Dataset laden: {args.dataset} ===")
+        frozen = load_frozen_dataset_for_training(args.dataset)
+        manifest = frozen.manifest
+        print(
+            f"Dataset: {manifest.get('dataset_version')} "
+            f"(schema {manifest.get('schema_version')}, "
+            f"generator {manifest.get('generator_version')}, "
+            f"seed {manifest.get('seed')})"
+        )
+        train_examples = list(frozen.train)
+        val_examples = list(frozen.validation)
+        iid_test_examples = list(frozen.iid_test)
+        ood_splits = dict(frozen.ood_splits)
+        ood_total = sum(len(records) for records in ood_splits.values())
+        print(f"Train: {len(train_examples)}, Validation: {len(val_examples)}")
+        if iid_test_examples:
+            print(f"Test (IID): {len(iid_test_examples)}")
+        if ood_total:
+            print(f"Test (OOD): {ood_total}")
+        # No paraphrase expansion for frozen records — they are already the
+        # canonical, versioned training contract.
+        if summary_mode == SUMMARY_MODE_NONE:
+            print("ABLATION: Alle Summaries durch [NO_SUMMARY] ersetzt")
+        return train_examples, val_examples, iid_test_examples, ood_splits, summary_mode, frozen
+
+    print("=== 1. Daten generieren (Legacy-Modus) ===")
+    scenarios = generate_parametric(num=args.num_scenarios, seed=args.seed)
+    counter = generate_counterexample_groups(num_groups=args.num_counter_groups, seed=args.seed + 1)
+    all_scenarios = scenarios + counter
+
+    val_count = int(len(all_scenarios) * args.val_split)
+    val_scenarios = all_scenarios[:val_count]
+    train_scenarios = all_scenarios[val_count:]
+
+    from .paraphrases import expand_with_paraphrases
+    # Expand before applying the run-wide serializer so full and none see the
+    # exact same sample order, labels and number of optimizer steps.
+    train_scenarios = expand_with_paraphrases(
+        train_scenarios,
+        num_paraphrases=args.num_paraphrases,
+        neutralize_ratio=args.neutralize_ratio,
+        seed=args.seed + 2,
+    )
+    if summary_mode == SUMMARY_MODE_NONE:
+        print("ABLATION: Alle Summaries durch [NO_SUMMARY] ersetzt")
+
+    print(f"Training (expandiert): {len(train_scenarios)}, Validation: {len(val_scenarios)}")
+    # Legacy mode has no frozen splits; evaluation falls back to the synthetic
+    # OOD tests in training/ood_tests.py and uses the held-out validation slice
+    # as the IID test signal.
+    return train_scenarios, val_scenarios, [], {}, summary_mode, None
+
+
 def _run_train(args) -> int:
     import torch
 
@@ -169,35 +286,20 @@ def _run_train(args) -> int:
     print(f"Device: {device}")
     print()
 
-    print("=== 1. Daten generieren ===")
-    scenarios = generate_parametric(num=args.num_scenarios, seed=args.seed)
-    counter = generate_counterexample_groups(num_groups=args.num_counter_groups, seed=args.seed + 1)
-    all_scenarios = scenarios + counter
-
-    val_count = int(len(all_scenarios) * args.val_split)
-    val_scenarios = all_scenarios[:val_count]
-    train_scenarios = all_scenarios[val_count:]
-    summary_mode = _summary_mode_from_args(args)
-
-    from .paraphrases import expand_with_paraphrases
-    # Expand before applying the run-wide serializer so full and none see the
-    # exact same sample order, labels and number of optimizer steps.
-    train_scenarios = expand_with_paraphrases(
-        train_scenarios,
-        num_paraphrases=args.num_paraphrases,
-        neutralize_ratio=args.neutralize_ratio,
-        seed=args.seed + 2,
-    )
-    if summary_mode == SUMMARY_MODE_NONE:
-        print("ABLATION: Alle Summaries durch [NO_SUMMARY] ersetzt")
-
-    print(f"Training (expandiert): {len(train_scenarios)}, Validation: {len(val_scenarios)}")
+    (
+        train_examples,
+        val_examples,
+        iid_test_examples,
+        ood_splits,
+        summary_mode,
+        frozen,
+    ) = _load_training_data(args)
 
     # Both ablation arms learn exactly the same BPE contract from the full
     # corpus.  Otherwise ``none`` would get a smaller vocabulary/model and the
     # experiment would change two variables at once.
     tokenizer_texts, texts = _serialization_corpora(
-        train_scenarios,
+        train_examples,
         summary_mode=summary_mode,
     )
     print()
@@ -216,6 +318,7 @@ def _run_train(args) -> int:
     config = _training_config_from_args(
         args,
         vocab_size=tokenizer.vocab_size,
+        frozen=frozen,
     )
     from src.models.model import EconomyEncoder
 
@@ -231,16 +334,44 @@ def _run_train(args) -> int:
     print(f"Parameter: {params/1e6:.2f}M")
     print()
 
+    def save_periodic_checkpoint(phase: str, completed_epochs: int) -> None:
+        path = _periodic_checkpoint_path(
+            args.output,
+            phase=phase,
+            completed_epochs=completed_epochs,
+        )
+        save_checkpoint(model, tokenizer, config, path)
+        print(
+            "Zwischencheckpoint: "
+            f"{path} (Phase: {phase}, abgeschlossene Epochen: {completed_epochs})"
+        )
+
     if not args.skip_pretrain:
         print("=== 4. Pretraining (MLM) ===")
         t0 = time.time()
-        pretrain(model, texts, tokenizer, config, device=device)
+        pretrain(
+            model,
+            texts,
+            tokenizer,
+            config,
+            device=device,
+            checkpoint_every_epochs=args.checkpoint_every,
+            checkpoint_callback=save_periodic_checkpoint,
+        )
         print(f"Pretraining: {time.time()-t0:.1f}s")
         print()
 
     print("=== 5. Score-Training ===")
     t0 = time.time()
-    train_scores(model, train_scenarios, tokenizer, config, device=device)
+    train_scores(
+        model,
+        train_examples,
+        tokenizer,
+        config,
+        device=device,
+        checkpoint_every_epochs=args.checkpoint_every,
+        checkpoint_callback=save_periodic_checkpoint,
+    )
     print(f"Score-Training: {time.time()-t0:.1f}s")
     print()
 
@@ -252,11 +383,93 @@ def _run_train(args) -> int:
     _evaluate(
         model,
         tokenizer,
-        val_scenarios,
+        val_examples,
         device,
         summary_mode=config.summary_mode,
+        iid_test_examples=iid_test_examples,
+        ood_splits=ood_splits,
     )
     return 0
+
+
+def _serialize_evaluation_example(example, *, summary_mode: str) -> str:
+    """Serialize either an EconomicScenario or a DatasetRecord for eval.
+
+    Both types carry a ``.score`` attribute and share the production
+    ContextSerializer path via training.bridge.
+    """
+
+    from .bridge import serialize_record
+
+    try:
+        from dataset.schema import DatasetRecord
+    except ModuleNotFoundError:
+        DatasetRecord = None  # type: ignore[assignment]
+
+    if DatasetRecord is not None and isinstance(example, DatasetRecord):
+        return serialize_record(example, summary_mode=summary_mode)
+    return serialize_scenario(example, summary_mode=summary_mode)
+
+
+def _example_score(example) -> float:
+    return float(example.score)
+
+
+def _predict_abs_error(model, tokenizer, example, device, *, summary_mode: str) -> float:
+    import torch
+
+    text = _serialize_evaluation_example(example, summary_mode=summary_mode)
+    token_ids = _encode_evaluation_text(model, tokenizer, text)
+    t = torch.tensor([token_ids], dtype=torch.long, device=device)
+    a = torch.ones_like(t)
+    with torch.inference_mode():
+        out = model(t, a)
+    pred = out["score"].item()
+    return abs(pred - _example_score(example))
+
+
+# Mapping from a frozen OOD split name to the predicate that identifies the
+# records which actually satisfy that split's OOD condition.  Records held in
+# the split only because their counterfactual family was held out (but which do
+# not themselves trigger the OOD rule) are excluded from the metric so each
+# OOD axis measures generalization, not family dilution.
+_OOD_METRIC_PREDICATES: dict[str, str] = {
+    "test_parameter_ood": "parameter",
+    "test_combination_ood": "combination",
+    "test_hard_ood": "hard",
+    "test_concept_ood": "concept",
+    "test_entity_ood": "entity",
+}
+
+
+def _ood_predicate_for_split(
+    split_name: str,
+    records: tuple,
+):
+    """Return a callable ``(record) -> bool`` selecting the metric-relevant
+    records of one OOD split, or ``None`` to include all records."""
+
+    from dataset.splits import (
+        is_combination_ood,
+        is_concept_ood,
+        is_hard_ood,
+        is_parameter_ood,
+    )
+
+    kind = _OOD_METRIC_PREDICATES.get(split_name)
+    if kind == "parameter":
+        return is_parameter_ood
+    if kind == "combination":
+        return is_combination_ood
+    if kind == "hard":
+        return is_hard_ood
+    if kind == "concept":
+        return is_concept_ood
+    if kind == "entity":
+        # Entity-OOD: every record in the split is out-of-distribution by
+        # construction (the whole entity is held out), so no extra filter.
+        return None
+    return None
 
 
 def _evaluate(
@@ -266,6 +479,8 @@ def _evaluate(
     device,
     *,
     summary_mode: str = SUMMARY_MODE_FULL,
+    iid_test_examples: list | None = None,
+    ood_splits: dict[str, tuple] | None = None,
 ) -> None:
     import torch
 
@@ -276,57 +491,117 @@ def _evaluate(
     if val_scenarios:
         total_abs_err = 0.0
         total_count = 0
-        for scenario in val_scenarios[:200]:
-            text = serialize_scenario(scenario, summary_mode=summary_mode)
+        for example in val_scenarios[:200]:
+            err = _predict_abs_error(
+                model, tokenizer, example, device, summary_mode=summary_mode
+            )
+            total_abs_err += err
+            total_count += 1
+        if total_count > 0:
+            print(f"IID MAE: {total_abs_err/total_count:.4f} (n={total_count})")
+    print()
+
+    # IID test split is reported separately and never folded into the OOD
+    # aggregate.  In frozen-dataset mode it comes from ``test_iid``; in legacy
+    # mode there is no held-out IID test slice and we simply skip the block.
+    if iid_test_examples:
+        print("=== 7b. Test (IID) ===")
+        total_abs_err = 0.0
+        total_count = 0
+        for example in iid_test_examples[:200]:
+            err = _predict_abs_error(
+                model, tokenizer, example, device, summary_mode=summary_mode
+            )
+            total_abs_err += err
+            total_count += 1
+        if total_count > 0:
+            print(f"Test IID MAE: {total_abs_err/total_count:.4f} (n={total_count})")
+        print()
+
+    print("=== 8. OOD-Tests ===")
+    by_category: dict[str, list[float]] = {}
+
+    if not ood_splits:
+        # Legacy mode: fall back to the synthetic OOD test suite.
+        from .ood_tests import all_ood_tests
+
+        for test in all_ood_tests():
+            text = serialize_scenario(test.scenario, summary_mode=summary_mode)
             token_ids = _encode_evaluation_text(model, tokenizer, text)
             t = torch.tensor([token_ids], dtype=torch.long, device=device)
             a = torch.ones_like(t)
             with torch.inference_mode():
                 out = model(t, a)
             pred = out["score"].item()
-            total_abs_err += abs(pred - scenario.score)
-            total_count += 1
-        if total_count > 0:
-            print(f"IID MAE: {total_abs_err/total_count:.4f} (n={total_count})")
-    print()
+            err = abs(pred - test.scenario.score)
+            category = test.category
+            if summary_mode == SUMMARY_MODE_NONE and category == "OOD_LANGUAGE":
+                category = "STRUCTURED_OOD (source: OOD_LANGUAGE)"
+            by_category.setdefault(category, []).append(err)
 
-    print("=== 8. OOD-Tests ===")
-    from .ood_tests import all_ood_tests
+        if summary_mode == SUMMARY_MODE_NONE:
+            print(
+                "Hinweis: OOD_LANGUAGE enthält ohne Summary keinen Sprach-OOD; "
+                "Ausgabe daher als STRUCTURED_OOD mit Quellkategorie OOD_LANGUAGE."
+            )
+    else:
+        # Frozen-dataset mode: evaluate each OOD split separately and filter
+        # the metric to the records that actually satisfy that split's OOD
+        # condition.  Family members held out only because of leakage control
+        # would otherwise dilute the OOD signal.
+        for split_name in (
+            "test_entity_ood",
+            "test_parameter_ood",
+            "test_combination_ood",
+            "test_hard_ood",
+            "test_concept_ood",
+        ):
+            examples = ood_splits.get(split_name)
+            if not examples:
+                continue
+            predicate = _ood_predicate_for_split(split_name, examples)
+            metric_examples = (
+                examples if predicate is None
+                else tuple(r for r in examples if predicate(r))
+            )
+            held_out_only = len(examples) - len(metric_examples)
+            errors: list[float] = []
+            for example in metric_examples:
+                errors.append(
+                    _predict_abs_error(
+                        model, tokenizer, example, device, summary_mode=summary_mode
+                    )
+                )
+            label = split_name.upper()
+            if held_out_only:
+                label = f"{label} (held-out-only: {held_out_only})"
+            if errors:
+                by_category[label] = errors
+            elif metric_examples:
+                # Empty errors list would drop the row; keep a zero-row visible
+                # only when there are metric examples but they produced no
+                # errors (impossible for abs).  This branch is defensive.
+                by_category[label] = errors
 
-    ood_tests = all_ood_tests()
-    by_category: dict[str, list[float]] = {}
-    for test in ood_tests:
-        text = serialize_scenario(test.scenario, summary_mode=summary_mode)
-        token_ids = _encode_evaluation_text(model, tokenizer, text)
-        t = torch.tensor([token_ids], dtype=torch.long, device=device)
-        a = torch.ones_like(t)
-        with torch.inference_mode():
-            out = model(t, a)
-        pred = out["score"].item()
-        err = abs(pred - test.scenario.score)
-        category = test.category
-        if summary_mode == SUMMARY_MODE_NONE and category == "OOD_LANGUAGE":
-            category = "STRUCTURED_OOD (source: OOD_LANGUAGE)"
-        by_category.setdefault(category, []).append(err)
-
-    if summary_mode == SUMMARY_MODE_NONE:
-        print(
-            "Hinweis: OOD_LANGUAGE enthält ohne Summary keinen Sprach-OOD; "
-            "Ausgabe daher als STRUCTURED_OOD mit Quellkategorie OOD_LANGUAGE."
-        )
-
-    print(f"{'Kategorie':20s} | {'MAE':>6s} | {'n':>3s}")
-    print("-" * 40)
+    print(f"{'Kategorie':40s} | {'MAE':>6s} | {'n':>3s}")
+    print("-" * 60)
     total_err = 0.0
     total_n = 0
     for cat, errs in sorted(by_category.items()):
+        if not errs:
+            print(f"{cat:40s} | {'--':>6s} | {0:>3d}")
+            continue
         mae = sum(errs) / len(errs)
-        print(f"{cat:20s} | {mae:.4f} | {len(errs)}")
+        print(f"{cat:40s} | {mae:.4f} | {len(errs)}")
         total_err += sum(errs)
         total_n += len(errs)
-    print("-" * 40)
-    print(f"{'OOD MAE':20s} | {total_err/total_n:.4f} | {total_n}")
+    print("-" * 60)
+    if total_n:
+        print(f"{'OOD MAE':40s} | {total_err/total_n:.4f} | {total_n}")
     print()
+
+    if ood_splits:
+        return
 
     print("=== 9. Score-Tests ===")
     from .scenarios import _compute_score, _build_context, EconomicScenario

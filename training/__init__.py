@@ -15,7 +15,15 @@ between training and production is the saved checkpoint (.pt file).
 from src.models.tokenizer import BPETokenizer
 from .scenarios import EconomicScenario, generate_parametric, generate_counterexample_groups
 from .ood_tests import OODTest, all_ood_tests, ood_by_category
-from .data import TrainingExample, generate_all, generate_training_examples, generate_counterexamples
+from .data import (
+    DatasetLoadError,
+    FrozenDataset,
+    TrainingExample,
+    generate_all,
+    generate_training_examples,
+    generate_counterexamples,
+    load_frozen_dataset_for_training,
+)
 
 _PIPELINE_EXPORTS = {
     "TrainingConfig",
@@ -41,7 +49,9 @@ def __getattr__(name: str):
 
 __all__ = [
     "BPETokenizer",
+    "DatasetLoadError",
     "EconomicScenario",
+    "FrozenDataset",
     "OODTest",
     "TrainingConfig",
     "TrainingExample",
@@ -54,6 +64,7 @@ __all__ = [
     "generate_parametric",
     "generate_training_examples",
     "load_checkpoint",
+    "load_frozen_dataset_for_training",
     "ood_by_category",
     "pretrain",
     "save_checkpoint",

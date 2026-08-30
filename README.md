@@ -47,6 +47,16 @@ src/
 ├── output/              # auditierbarer Score-Export für externe Systeme
 ├── domain.py            # gemeinsame, unveränderliche Verträge
 └── pipeline.py          # Extraction → Memory → Retrieval → Score
+
+dataset/
+├── schema.py            # kanonischer Ground-Truth-Vertrag
+├── companies/           # persistente strukturelle Firmenprofile
+├── mechanisms/          # Registry mit 15 abstrakten Mechanismen
+├── labeling/            # Event → StateDelta → EconomicImpact + Verifier
+├── counterfactuals.py   # kontrollierte Ein-Variablen-Familien
+├── splits.py            # IID- und OOD-Splitvertrag
+├── generate.py          # reproduzierbare Datengenerierung
+└── export.py            # unveränderliche JSONL-Artefakte + Manifest
 ~~~
 
 sources liegt bewusst **vor** dem Kern. output liegt bewusst **nach** dem Kern und enthält keine technische Analyse oder Marktprognose.
@@ -61,6 +71,8 @@ sources liegt bewusst **vor** dem Kern. output liegt bewusst **nach** dem Kern u
 - Reddit-JSON-Collector mit Entity Resolution, Thread-Kommentaren, Pagination, Rate-Limit-Fehlern und append-only Revisionen/Engagement-Snapshots
 - Social-Adapter: sichtbare Posts und Kommentare werden zu gewöhnlichen SourceDocument-Werten und durchlaufen denselben Extraction-/RAG-Pfad wie News
 - stabiles JSON-Exportformat economy-score-output-v1
+- versionierte synthetische Dataset-Pipeline mit State-Delta-Labels,
+  Counterfactuals, leakage-resistenten IID/OOD-Splits und SHA-256-Manifest
 
 Nicht enthalten sind absichtlich ein Prediction-Modell, Markt-/Makro-Feature-Fusion, eine Renditeprognose und ein Trading-System.
 
@@ -127,6 +139,27 @@ Voraussetzung: Python 3.11+.
 python3 -m src info
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q
 ~~~
+
+Ein festes Dataset wird unabhängig vom Training erzeugt und danach explizit
+eingelesen:
+
+~~~bash
+python3 -m dataset.generate --output data/dataset_v1 \
+  --dataset-version 1.0 --seed 42 --companies 10000 --bases 20000
+python3 -m training train --dataset data/dataset_v1 --seed 42 \
+  --output .model_checkpoints/economy_encoder_dataset_v1.pt
+~~~
+
+Während eines Trainingslaufs wird nach jeder Epoche beider Phasen ein
+inferenzfähiger Zwischencheckpoint gespeichert. Zu
+`--output .model_checkpoints/model.pt` gehören beispielsweise
+`.model_checkpoints/model.checkpoints/pretrain_epoch_001.pt` und
+`.model_checkpoints/model.checkpoints/score_epoch_001.pt`; der finale
+Checkpoint wird weiterhin exakt unter `--output` abgelegt. Mit
+`--checkpoint-every 2` wird nur nach jeder zweiten Epoche gespeichert.
+
+Der vollständige Record-, Mechanismus-, Split- und Versionsvertrag steht in
+[DATASET_SPEC.md](DATASET_SPEC.md).
 
 Tests fuer Modell, Adapter und Training werden ohne die optionale
 PyTorch-Abhaengigkeit sauber uebersprungen. Fuer die vollstaendige Suite:

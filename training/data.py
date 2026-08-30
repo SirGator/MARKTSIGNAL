@@ -10,8 +10,10 @@ language variant. This ensures the model learns economics, not phrasing.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import random
 from dataclasses import dataclass
+from pathlib import Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -330,3 +332,125 @@ def generate_all(
     examples = generate_training_examples(num_per_template=num_per_template, seed=seed)
     counter = generate_counterexamples(num_groups=num_counter_groups, seed=seed + 1)
     return examples + counter
+
+
+# ---------------------------------------------------------------------------
+# Frozen-dataset loader — the bridge from dataset/* to training/*.
+# ---------------------------------------------------------------------------
+
+# Single source of truth for split roles lives in dataset.splits.  Importing
+# the canonical tuples here keeps the loader and the metric in sync with the
+# split contract without re-hard-coding the names.
+from dataset.splits import (
+    IID_EVAL_SPLITS,
+    OOD_EVAL_SPLITS,
+    SPLIT_NAMES,
+)
+
+
+class DatasetLoadError(ValueError):
+    """Raised when a frozen dataset cannot be loaded for training."""
+
+
+class FrozenDataset:
+    """Loaded frozen dataset viewed through the training contract.
+
+    ``train`` and ``validation`` are the labeled training splits.
+    ``iid_test`` exposes the in-distribution test split(s) separately from the
+    OOD splits, so the evaluation report never folds IID data into the OOD
+    aggregate.  ``ood_splits`` holds only the genuinely out-of-distribution
+    evaluation splits (entity / parameter / combination / hard / concept).
+
+    Every exposed record is a :class:`dataset.schema.DatasetRecord` value and
+    therefore carries a ``.score`` property compatible with the existing
+    :class:`training.pipeline.ScoreDataset`.
+    """
+
+    __slots__ = (
+        "dataset_dir",
+        "manifest",
+        "train",
+        "validation",
+        "iid_test",
+        "ood_splits",
+    )
+
+    def __init__(
+        self,
+        dataset_dir: Path | str,
+        *,
+        train: tuple,
+        validation: tuple,
+        iid_test: tuple,
+        ood_splits: Mapping[str, tuple],
+        manifest: Mapping[str, object],
+    ) -> None:
+        self.dataset_dir = Path(dataset_dir)
+        self.manifest = manifest
+        self.train = train
+        self.validation = validation
+        self.iid_test = iid_test
+        self.ood_splits = dict(ood_splits)
+
+    @property
+    def train_examples(self) -> tuple:
+        """Alias for the train split, matching the existing pipeline naming."""
+
+        return self.train
+
+    @property
+    def validation_examples(self) -> tuple:
+        return self.validation
+
+    def __len__(self) -> int:
+        return len(self.train) + len(self.validation)
+
+    def all_examples(self) -> tuple:
+        """Return train + validation concatenated (for tokenizer training)."""
+
+        return (*self.train, *self.validation)
+
+
+def load_frozen_dataset_for_training(
+    dataset_dir: Path | str,
+    *,
+    verify_hashes: bool = True,
+) -> FrozenDataset:
+    """Load a frozen dataset and expose the splits used by training.
+
+    Thin wrapper around :func:`dataset.export.load_frozen_dataset` that
+    separates labeled training/validation data, in-distribution test data, and
+    the held-out OOD test splits, and keeps the manifest for reproducibility
+    logging.
+    """
+
+    from dataset.export import load_frozen_dataset
+
+    if isinstance(dataset_dir, str) and not dataset_dir.strip():
+        raise DatasetLoadError("dataset_dir must be a non-empty path")
+    root = Path(dataset_dir)
+    if not root.exists():
+        raise DatasetLoadError(f"frozen dataset not found: {root}")
+
+    splits, manifest = load_frozen_dataset(root, verify_hashes=verify_hashes)
+
+    missing = [name for name in ("train", "validation") if name not in splits]
+    if missing:
+        raise DatasetLoadError(
+            f"dataset is missing required training splits: {missing}"
+        )
+
+    iid_test = tuple(
+        records for name in IID_EVAL_SPLITS for records in splits.get(name, ())
+    )
+    # Keep the per-split identity so the evaluation report can still group by
+    # split name; expose a flat list only where the caller wants convenience.
+    ood_splits = {name: splits[name] for name in OOD_EVAL_SPLITS if name in splits}
+    return FrozenDataset(
+        dataset_dir=root,
+        train=splits["train"],
+        validation=splits["validation"],
+        iid_test=iid_test,
+        ood_splits=ood_splits,
+        manifest=manifest,
+    )

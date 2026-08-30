@@ -195,6 +195,12 @@ strukturierten Felder und wird entsprechend als Structured-OOD ausgewiesen.
 
 ## Synthetische Datengenerierung
 
+Der aktive, versionierte Datenvertrag ist in [DATASET_SPEC.md](DATASET_SPEC.md)
+und `dataset/schema.py` definiert. Der Generator schreibt feste JSONL-Splits
+mit Manifest und Checksums; `training/` kann diese mit `--dataset` laden. Der
+ältere Generator in `training/scenarios.py` bleibt nur als kompatibler
+Legacy-/Smoke-Test-Pfad bestehen.
+
 Schritt 1: Strukturierte Szenarien mit wirtschaftlicher Regel als Label.
 
 ```python

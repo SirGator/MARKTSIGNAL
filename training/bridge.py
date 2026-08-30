@@ -1,10 +1,14 @@
-"""Bridge: EconomicScenario -> ContextBundle -> ContextSerializer.
+"""Bridge: EconomicScenario / DatasetRecord -> ContextBundle -> ContextSerializer.
 
 Training and production use EXACTLY the same serialization path:
 
-    Scenario -> to_context_bundle() -> ContextSerializer.serialize() -> Tokenizer -> Model
+    Scenario/Record -> to_context_bundle() -> ContextSerializer.serialize() -> Tokenizer -> Model
 
 This guarantees the model sees the same input format in training and inference.
+Two source types feed the same ContextBundle contract:
+
+    - training.scenarios.EconomicScenario  (legacy parametric generator)
+    - dataset.schema.DatasetRecord          (frozen, versioned dataset)
 """
 
 from __future__ import annotations
@@ -25,6 +29,10 @@ from src.models.context_serializer import (
 )
 
 from .scenarios import EconomicScenario
+
+# DatasetRecord is imported lazily inside the functions that need it to keep
+# the training dependency graph shallow and avoid importing dataset.* unless a
+# frozen dataset is actually used.
 
 
 def scenario_to_context_bundle(
@@ -173,3 +181,144 @@ def serialize_scenario(
     # event summaries.  It never mutates the frozen ContextBundle/scenario.
     serializer = ContextSerializer(summary_mode=mode)
     return serializer.serialize(bundle, horizon=f"{scenario.horizon_days}d")
+
+
+# ---------------------------------------------------------------------------
+# DatasetRecord bridge — frozen dataset records feed the same ContextBundle.
+# ---------------------------------------------------------------------------
+
+def _subject_token_for_record(record) -> str:
+    """Return the subject string used in the serialized event line."""
+
+    return f"{record.event.subject_class}:{record.event.subject}"
+
+
+def record_to_context_bundle(
+    record,
+    *,
+    base_time: datetime | None = None,
+):
+    """Convert a frozen :class:`dataset.schema.DatasetRecord` into a ContextBundle.
+
+    The ContextBundle uses the same domain types as production
+    (CanonicalEvent, CaseRef, ContextFact) and therefore flows through the
+    exact same :class:`ContextSerializer` path as scenario-based training and
+    production inference.  Only the structural context factors that the record
+    actually carries are emitted as facts; absent (unknown) factors are omitted
+    just as in production retrieval.
+    """
+
+    from dataset.schema import DatasetRecord  # local import; see module note
+
+    if not isinstance(record, DatasetRecord):
+        raise TypeError("record must be a DatasetRecord")
+
+    if base_time is None:
+        base_time = datetime(2026, 1, 1, 12, tzinfo=timezone.utc)
+
+    occurred_at = base_time
+    observed_at = base_time
+    cutoff = base_time
+    retrieved_at = base_time
+
+    provenance = ProvenanceRecord(
+        source_id=record.metadata.source,
+        source_type="dataset",
+        observed_at=observed_at,
+    )
+
+    summary = record.event.summary or _default_record_summary(record)
+
+    event = CanonicalEvent(
+        event_id=f"event:{record.id}",
+        event_type=record.event.mechanism,
+        summary=summary,
+        occurred_at=occurred_at,
+        observed_at=observed_at,
+        subject_ids=(_subject_token_for_record(record),),
+        direction=record.event.direction,
+        magnitude=record.event.magnitude,
+        unit=record.event.unit or "fraction",
+        confidence=record.confidence,
+        provenance=(provenance,),
+    )
+
+    case = CaseRef(
+        case_id=f"case:{record.target.entity_id}",
+        entity_id=record.target.entity_id,
+        name=record.target.entity_id,
+        case_type="company",
+    )
+
+    facts = _build_record_facts(record, case, observed_at)
+
+    return ContextBundle(
+        event=event,
+        case=case,
+        cutoff=cutoff,
+        retrieved_at=retrieved_at,
+        horizon=f"{record.horizon_days}d",
+        facts=facts,
+    )
+
+
+def _default_record_summary(record) -> str:
+    """Synthesize a terse deterministic summary when the record has none.
+
+    Structured-only datasets legitimately omit ``event.summary``.  The
+    serializer still needs a non-empty string, so we render the mechanism,
+    direction, subject, and magnitude in a stable template.  When the run
+    uses ``summary_mode='none'`` this summary is replaced by ``[NO_SUMMARY]``
+    downstream and never reaches the model.
+    """
+
+    direction = record.event.direction
+    mechanism = record.event.mechanism
+    subject = record.event.subject or record.event.subject_class
+    magnitude = record.event.magnitude
+    return f"{subject} {mechanism} {direction} {magnitude:g}"
+
+
+def _build_record_facts(record, case, observed_at):
+    """Emit one ContextFact per supplied structural context factor.
+
+    Every supplied factor is a normalized ratio in [0, 1]; we surface it as a
+    percent-valued fact so the model sees the same ``predicate=value;unit``
+    shape that production retrieval produces.
+    """
+
+    from dataset.schema import CONTEXT_FACTOR_FIELDS
+
+    facts: list[ContextFact] = []
+    for index, name in enumerate(CONTEXT_FACTOR_FIELDS):
+        value = getattr(record.context, name)
+        if value is None:
+            continue
+        facts.append(
+            ContextFact(
+                fact_id=f"fact:{index}",
+                subject_id=case.entity_id,
+                predicate=name,
+                value=float(value),
+                unit="ratio",
+                observed_at=observed_at,
+                confidence=record.confidence,
+            )
+        )
+    return tuple(facts)
+
+
+def serialize_record(
+    record,
+    *,
+    summary_mode: str = SUMMARY_MODE_FULL,
+) -> str:
+    """Serialize a frozen dataset record through the PRODUCTION path.
+
+    Mirror of :func:`serialize_scenario` for :class:`DatasetRecord` values.
+    """
+
+    mode = normalize_summary_mode(summary_mode)
+    bundle = record_to_context_bundle(record)
+    serializer = ContextSerializer(summary_mode=mode)
+    return serializer.serialize(bundle, horizon=f"{record.horizon_days}d")

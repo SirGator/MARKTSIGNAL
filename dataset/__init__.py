@@ -1,0 +1,41 @@
+"""Canonical dataset contracts for generation, export, and training."""
+
+from .schema import (
+    CONTEXT_FACTOR_FIELDS,
+    DATASET_SCHEMA_VERSION,
+    EVENT_DIRECTIONS,
+    MECHANISMS,
+    MECHANISM_SET,
+    STATE_DELTA_FIELDS,
+    CompanyProfile,
+    CostStructure,
+    CounterfactualProvenance,
+    DatasetRecord,
+    EconomicContext,
+    Event,
+    FinancialProfile,
+    Metadata,
+    ResilienceProfile,
+    StateDelta,
+    Target,
+)
+
+__all__ = [
+    "CONTEXT_FACTOR_FIELDS",
+    "DATASET_SCHEMA_VERSION",
+    "EVENT_DIRECTIONS",
+    "MECHANISMS",
+    "MECHANISM_SET",
+    "STATE_DELTA_FIELDS",
+    "CompanyProfile",
+    "CostStructure",
+    "CounterfactualProvenance",
+    "DatasetRecord",
+    "EconomicContext",
+    "Event",
+    "FinancialProfile",
+    "Metadata",
+    "ResilienceProfile",
+    "StateDelta",
+    "Target",
+]

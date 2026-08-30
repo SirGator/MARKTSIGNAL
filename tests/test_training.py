@@ -20,6 +20,7 @@ from training.pipeline import (
     save_checkpoint,
     load_checkpoint,
 )
+from training.cli import _build_parser, _periodic_checkpoint_path
 
 
 class TrainingPipelineTests(unittest.TestCase):
@@ -86,6 +87,68 @@ class TrainingPipelineTests(unittest.TestCase):
         score = out["score"].item()
         self.assertGreaterEqual(score, -1.0)
         self.assertLessEqual(score, 1.0)
+
+    def test_training_emits_checkpoints_at_epoch_intervals(self) -> None:
+        scenarios = generate_parametric(num=4, seed=11)
+        texts = [scenario.to_serialized() for scenario in scenarios]
+        tokenizer = build_tokenizer(texts, vocab_size=80)
+        config = TrainingConfig(
+            model_dir=self.model_dir,
+            vocab_size=tokenizer.vocab_size,
+            d_model=16,
+            num_heads=4,
+            num_layers=1,
+            ff_dim=32,
+            max_seq_len=64,
+            dropout=0.0,
+            batch_size=4,
+            max_epochs=3,
+            log_every=999,
+        )
+        model = EconomyEncoder(
+            vocab_size=config.vocab_size,
+            d_model=config.d_model,
+            num_heads=config.num_heads,
+            num_layers=config.num_layers,
+            ff_dim=config.ff_dim,
+            max_seq_len=config.max_seq_len,
+            dropout=config.dropout,
+            pad_idx=tokenizer.vocab.get("[pad]", 0),
+            cls_idx=tokenizer.vocab.get("[cls]", 1),
+            sep_idx=tokenizer.vocab.get("[sep]", 2),
+        )
+        checkpoints: list[tuple[str, int]] = []
+
+        pretrain(
+            model,
+            texts,
+            tokenizer,
+            config,
+            checkpoint_every_epochs=2,
+            checkpoint_callback=lambda phase, epoch: checkpoints.append((phase, epoch)),
+        )
+        train_scores(
+            model,
+            scenarios,
+            tokenizer,
+            config,
+            checkpoint_every_epochs=2,
+            checkpoint_callback=lambda phase, epoch: checkpoints.append((phase, epoch)),
+        )
+
+        self.assertEqual(checkpoints, [("pretrain", 2), ("score", 2)])
+
+    def test_checkpoint_cli_defaults_and_snapshot_paths(self) -> None:
+        args = _build_parser().parse_args(["train"])
+        self.assertEqual(args.checkpoint_every, 1)
+        self.assertEqual(
+            _periodic_checkpoint_path(
+                Path(".model_checkpoints/model.pt"),
+                phase="score",
+                completed_epochs=12,
+            ),
+            Path(".model_checkpoints/model.checkpoints/score_epoch_012.pt"),
+        )
 
     def test_counterexamples_force_case_dependency(self) -> None:
         scenarios = generate_parametric(num=2000, seed=2)

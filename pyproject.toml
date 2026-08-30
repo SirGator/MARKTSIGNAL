@@ -15,9 +15,10 @@ dev = ["pytest>=7"]
 
 [project.scripts]
 marktsignal = "src.__main__:main"
+marktsignal-dataset = "dataset.generate:main"
 
 [tool.setuptools.packages.find]
-include = ["src*"]
+include = ["src*", "training*", "dataset*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

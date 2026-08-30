@@ -9,7 +9,7 @@ Both phases use the same EconomyEncoder architecture.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 import hmac
 import math
@@ -41,6 +41,7 @@ from .scenarios import EconomicScenario
 
 
 PAD_IDX = 0
+CheckpointCallback = Callable[[str, int], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +66,10 @@ class TrainingConfig:
     feature_schema_version: str | None = None
     summary_mode: str = SUMMARY_MODE_FULL
     seed: int = 42
+    dataset_version: str | None = None
+    dataset_schema_version: str | None = None
+    dataset_generator_version: str | None = None
+    dataset_seed: int | None = None
 
     def __post_init__(self) -> None:
         mode = normalize_summary_mode(self.summary_mode)
@@ -107,6 +112,31 @@ class TrainingConfig:
         )
         if isinstance(self.seed, bool) or not isinstance(self.seed, int):
             raise TypeError("seed must be an integer")
+        dataset_fields = (
+            self.dataset_version,
+            self.dataset_schema_version,
+            self.dataset_generator_version,
+            self.dataset_seed,
+        )
+        if any(value is not None for value in dataset_fields):
+            if any(value is None for value in dataset_fields):
+                raise ValueError(
+                    "dataset version, schema, generator, and seed must be set together"
+                )
+            for name in (
+                "dataset_version",
+                "dataset_schema_version",
+                "dataset_generator_version",
+            ):
+                value = getattr(self, name)
+                if not isinstance(value, str) or not value.strip():
+                    raise ValueError(f"{name} must be a non-empty string")
+                object.__setattr__(self, name, value.strip())
+            if isinstance(self.dataset_seed, bool) or not isinstance(
+                self.dataset_seed,
+                int,
+            ):
+                raise TypeError("dataset_seed must be an integer")
         if isinstance(self.max_seq_len, bool) or not isinstance(
             self.max_seq_len,
             int,
@@ -198,17 +228,31 @@ def serialize_training_example(example, *, summary_mode: str) -> str:
     ContextBundle bridge as evaluation.  The unstructured legacy
     TrainingExample format remains supported only for full-summary runs;
     structured-only runs fail closed instead of dropping economic fields.
+
+    DatasetRecord values (from a frozen, versioned dataset) are routed through
+    the same ContextBundle path via :func:`training.bridge.serialize_record`.
     """
+
     mode = normalize_summary_mode(summary_mode)
     if isinstance(example, EconomicScenario):
         return serialize_scenario(example, summary_mode=mode)
+
+    # Avoid importing dataset.* when torch-only environments do not need it.
+    try:
+        from dataset.schema import DatasetRecord
+    except ModuleNotFoundError:
+        DatasetRecord = None  # type: ignore[assignment]
+    if DatasetRecord is not None and isinstance(example, DatasetRecord):
+        from .bridge import serialize_record
+        return serialize_record(example, summary_mode=mode)
 
     serialized = example.to_serialized()
     if mode == SUMMARY_MODE_FULL:
         return serialized
     raise ValueError(
-        "summary_mode='none' requires EconomicScenario structured fields; "
-        "legacy TrainingExample would lose event type/direction/magnitude"
+        "summary_mode='none' requires EconomicScenario or DatasetRecord "
+        "structured fields; legacy TrainingExample would lose event "
+        "type/direction/magnitude"
     )
 
 
@@ -332,6 +376,15 @@ def save_checkpoint(
         "tokenizer_hash": tokenizer.fingerprint,
         "seed": config.seed,
     }
+    if config.dataset_version is not None:
+        checkpoint_config.update(
+            {
+                "dataset_version": config.dataset_version,
+                "dataset_schema_version": config.dataset_schema_version,
+                "dataset_generator_version": config.dataset_generator_version,
+                "dataset_seed": config.dataset_seed,
+            }
+        )
     validate_checkpoint_token_ids(
         checkpoint_config,
         tokenizer.vocab,
@@ -427,11 +480,19 @@ def pretrain(
     tokenizer: "BPETokenizer",
     config: TrainingConfig,
     device: torch.device | None = None,
+    *,
+    checkpoint_every_epochs: int = 0,
+    checkpoint_callback: CheckpointCallback | None = None,
 ) -> dict[str, list[float]]:
     """Phase 1: Pretrain EconomyEncoder with MLM.
 
     Returns loss history for logging.
     """
+    _validate_checkpoint_callback(
+        checkpoint_every_epochs,
+        checkpoint_callback,
+    )
+
     if device is None:
         device = torch.device("cpu")
 
@@ -499,6 +560,13 @@ def pretrain(
                 losses.append(loss.item())
                 print(f"[pretrain] epoch={epoch} step={step} loss={loss.item():.4f}")
 
+        _save_periodic_checkpoint_if_due(
+            phase="pretrain",
+            completed_epochs=epoch + 1,
+            checkpoint_every_epochs=checkpoint_every_epochs,
+            checkpoint_callback=checkpoint_callback,
+        )
+
     return {"losses": losses}
 
 
@@ -508,11 +576,19 @@ def train_scores(
     tokenizer: "BPETokenizer",
     config: TrainingConfig,
     device: torch.device | None = None,
+    *,
+    checkpoint_every_epochs: int = 0,
+    checkpoint_callback: CheckpointCallback | None = None,
 ) -> dict[str, list[float]]:
     """Phase 2: Train EconomyEncoder on score labels with SmoothL1Loss.
 
     Returns loss history for logging.
     """
+    _validate_checkpoint_callback(
+        checkpoint_every_epochs,
+        checkpoint_callback,
+    )
+
     if device is None:
         device = torch.device("cpu")
 
@@ -571,7 +647,52 @@ def train_scores(
                 losses.append(loss.item())
                 print(f"[score] epoch={epoch} step={step} loss={loss.item():.4f}")
 
+        _save_periodic_checkpoint_if_due(
+            phase="score",
+            completed_epochs=epoch + 1,
+            checkpoint_every_epochs=checkpoint_every_epochs,
+            checkpoint_callback=checkpoint_callback,
+        )
+
     return {"losses": losses}
+
+
+def _validate_checkpoint_callback(
+    checkpoint_every_epochs: int,
+    checkpoint_callback: CheckpointCallback | None,
+) -> None:
+    """Validate the optional epoch-boundary checkpoint hook."""
+
+    if isinstance(checkpoint_every_epochs, bool) or not isinstance(
+        checkpoint_every_epochs,
+        int,
+    ):
+        raise TypeError("checkpoint_every_epochs must be an integer")
+    if checkpoint_every_epochs < 0:
+        raise ValueError("checkpoint_every_epochs must be non-negative")
+    if checkpoint_callback is not None and not callable(checkpoint_callback):
+        raise TypeError("checkpoint_callback must be callable")
+    if checkpoint_every_epochs > 0 and checkpoint_callback is None:
+        raise ValueError(
+            "checkpoint_callback is required when checkpoint_every_epochs is positive"
+        )
+
+
+def _save_periodic_checkpoint_if_due(
+    *,
+    phase: str,
+    completed_epochs: int,
+    checkpoint_every_epochs: int,
+    checkpoint_callback: CheckpointCallback | None,
+) -> None:
+    """Invoke a checkpoint hook after a configured completed epoch."""
+
+    if (
+        checkpoint_callback is not None
+        and checkpoint_every_epochs > 0
+        and completed_epochs % checkpoint_every_epochs == 0
+    ):
+        checkpoint_callback(phase, completed_epochs)
 
 
 def _forward_embeddings(
