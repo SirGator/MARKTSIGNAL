@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import math
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from src.models.context_serializer import (
+from .modeling.context_serializer import (
     SUMMARY_MODE_FULL,
     SUMMARY_MODE_NONE,
     normalize_summary_mode,
@@ -36,7 +37,14 @@ def _build_parser() -> argparse.ArgumentParser:
     train_cmd.add_argument("--batch-size", type=int, default=32)
     train_cmd.add_argument("--lr", type=float, default=3e-4, help="learning rate")
     train_cmd.add_argument("--max-seq-len", type=int, default=512)
-    train_cmd.add_argument("--vocab-size", type=int, default=4000)
+    train_cmd.add_argument(
+        "--vocab-size",
+        type=int,
+        default=4000,
+        help="BPE vocabulary size; note the MODEL_SPEC reference architecture "
+        "uses 24.000 tokens (~23.4M parameters) while the CLI default of "
+        "4.000 yields the compact ~15.7M variant",
+    )
     train_cmd.add_argument("--num-scenarios", type=int, default=5000, help="parametric scenarios (legacy mode)")
     train_cmd.add_argument("--num-counter-groups", type=int, default=200)
     train_cmd.add_argument("--seed", type=int, default=42)
@@ -56,12 +64,44 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="EPOCHS",
         help="save an inference-ready snapshot after every N epochs in each phase (default: 1)",
     )
+    train_cmd.add_argument(
+        "--resume",
+        type=Path,
+        default=None,
+        help="continue exactly from a resumable periodic checkpoint",
+    )
+    train_cmd.add_argument(
+        "--keep-checkpoints",
+        type=int,
+        default=3,
+        metavar="COUNT",
+        help="keep only the newest COUNT periodic snapshots per phase (default: 3)",
+    )
+    train_cmd.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=3,
+        metavar="EPOCHS",
+        help="stop score training after this many non-improving epochs; 0 disables it",
+    )
+    train_cmd.add_argument(
+        "--early-stopping-min-delta",
+        type=float,
+        default=1e-4,
+        help="minimum validation-MAE improvement (default: 0.0001)",
+    )
     train_cmd.add_argument("--skip-pretrain", action="store_true", help="skip MLM pretraining")
     train_cmd.add_argument("--device", default="auto", help="cpu | cuda | auto")
     train_cmd.add_argument("--log-every", type=int, default=50, help="log loss every N steps")
     train_cmd.add_argument("--val-split", type=float, default=0.1, help="fraction held out for validation (legacy mode)")
     train_cmd.add_argument("--num-paraphrases", type=int, default=3, help="paraphrase variants per scenario (legacy mode)")
     train_cmd.add_argument("--neutralize-ratio", type=float, default=0.25, help="fraction with [NO_SUMMARY] (legacy mode)")
+    train_cmd.add_argument(
+        "--runtime-noise-ratio",
+        type=float,
+        default=0.2,
+        help="fraction of training samples duplicated with mild article-like noise (default: 0.2)",
+    )
     train_cmd.add_argument("--no-summary", action="store_true", help="ablation: replace ALL summaries with [NO_SUMMARY]")
 
     subcommands.add_parser("info", help="show training data statistics")
@@ -76,6 +116,17 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "train" and args.checkpoint_every < 1:
         parser.error("--checkpoint-every must be at least 1")
+    if args.command == "train" and args.keep_checkpoints < 1:
+        parser.error("--keep-checkpoints must be at least 1")
+    if args.command == "train" and not 0.0 <= args.runtime_noise_ratio <= 1.0:
+        parser.error("--runtime-noise-ratio must be between 0 and 1")
+    if args.command == "train" and args.early_stopping_patience < 0:
+        parser.error("--early-stopping-patience must be non-negative")
+    if args.command == "train" and (
+        not math.isfinite(args.early_stopping_min_delta)
+        or args.early_stopping_min_delta < 0.0
+    ):
+        parser.error("--early-stopping-min-delta must be finite and non-negative")
 
     if args.command == "info":
         scenarios = generate_parametric(num=100, seed=42)
@@ -109,6 +160,14 @@ def _training_config_from_args(
     from .pipeline import TrainingConfig
 
     manifest = None if frozen is None else frozen.manifest
+    if frozen is None:
+        from .paraphrases import LEGACY_RUNTIME_NOISE_VERSION
+
+        noise_profile_version = LEGACY_RUNTIME_NOISE_VERSION
+    else:
+        from .runtime_views import RUNTIME_VIEW_VERSION
+
+        noise_profile_version = RUNTIME_VIEW_VERSION
     return TrainingConfig(
         model_dir=args.output.parent,
         vocab_size=vocab_size,
@@ -129,6 +188,8 @@ def _training_config_from_args(
             None if manifest is None else str(manifest["generator_version"])
         ),
         dataset_seed=(None if manifest is None else int(manifest["seed"])),
+        runtime_noise_ratio=args.runtime_noise_ratio,
+        runtime_noise_profile_version=noise_profile_version,
     )
 
 
@@ -149,6 +210,38 @@ def _periodic_checkpoint_path(
 
     checkpoint_dir = output.with_suffix(".checkpoints")
     return checkpoint_dir / f"{phase}_epoch_{completed_epochs:03d}.pt"
+
+
+def _prune_periodic_checkpoints(
+    output: Path,
+    *,
+    phase: str,
+    keep: int,
+) -> list[Path]:
+    """Delete only obsolete periodic snapshots for one training phase."""
+
+    if phase not in {"pretrain", "score"}:
+        raise ValueError(f"unknown checkpoint phase: {phase!r}")
+    if isinstance(keep, bool) or not isinstance(keep, int):
+        raise TypeError("keep must be an integer")
+    if keep < 1:
+        raise ValueError("keep must be at least 1")
+
+    checkpoint_dir = output.with_suffix(".checkpoints")
+    candidates: list[tuple[int, Path]] = []
+    for path in checkpoint_dir.glob(f"{phase}_epoch_*.pt"):
+        try:
+            epoch = int(path.stem.rsplit("_", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        candidates.append((epoch, path))
+    candidates.sort(key=lambda item: (item[0], item[1].name))
+
+    removed: list[Path] = []
+    for _, path in candidates[:-keep]:
+        path.unlink()
+        removed.append(path)
+    return removed
 
 
 def _serialization_corpora(
@@ -230,8 +323,19 @@ def _load_training_data(args):
             print(f"Test (IID): {len(iid_test_examples)}")
         if ood_total:
             print(f"Test (OOD): {ood_total}")
-        # No paraphrase expansion for frozen records — they are already the
-        # canonical, versioned training contract.
+        from .runtime_views import add_frozen_runtime_views
+
+        clean_count = len(train_examples)
+        train_examples = add_frozen_runtime_views(
+            train_examples,
+            ratio=args.runtime_noise_ratio,
+            seed=args.seed + 3,
+        )
+        noisy_count = len(train_examples) - clean_count
+        if noisy_count:
+            print(f"Runtime-nahe Frozen-Views: +{noisy_count}")
+        # The frozen artifact stays immutable; views exist only in this train
+        # split and never enter validation or OOD evaluation.
         if summary_mode == SUMMARY_MODE_NONE:
             print("ABLATION: Alle Summaries durch [NO_SUMMARY] ersetzt")
         return train_examples, val_examples, iid_test_examples, ood_splits, summary_mode, frozen
@@ -245,7 +349,7 @@ def _load_training_data(args):
     val_scenarios = all_scenarios[:val_count]
     train_scenarios = all_scenarios[val_count:]
 
-    from .paraphrases import expand_with_paraphrases
+    from .paraphrases import add_runtime_noise, expand_with_paraphrases
     # Expand before applying the run-wide serializer so full and none see the
     # exact same sample order, labels and number of optimizer steps.
     train_scenarios = expand_with_paraphrases(
@@ -254,6 +358,15 @@ def _load_training_data(args):
         neutralize_ratio=args.neutralize_ratio,
         seed=args.seed + 2,
     )
+    clean_count = len(train_scenarios)
+    train_scenarios = add_runtime_noise(
+        train_scenarios,
+        ratio=args.runtime_noise_ratio,
+        seed=args.seed + 3,
+    )
+    noisy_count = len(train_scenarios) - clean_count
+    if noisy_count:
+        print(f"Runtime-nahe Textvarianten: +{noisy_count}")
     if summary_mode == SUMMARY_MODE_NONE:
         print("ABLATION: Alle Summaries durch [NO_SUMMARY] ersetzt")
 
@@ -271,6 +384,7 @@ def _run_train(args) -> int:
         build_tokenizer,
         pretrain,
         save_checkpoint,
+        load_training_checkpoint,
         train_scores,
     )
 
@@ -320,33 +434,80 @@ def _run_train(args) -> int:
         vocab_size=tokenizer.vocab_size,
         frozen=frozen,
     )
-    from src.models.model import EconomyEncoder
+    resume_state: dict[str, object] | None = None
+    resume_phase: str | None = None
+    if args.resume is not None:
+        model, resumed_tokenizer, _, resume_state = load_training_checkpoint(
+            args.resume
+        )
+        if resumed_tokenizer.fingerprint != tokenizer.fingerprint:
+            raise ValueError(
+                "resume checkpoint tokenizer differs from the current dataset"
+            )
+        tokenizer = resumed_tokenizer
+        resume_phase = str(resume_state["phase"])
+        if resume_phase == "pretrain" and args.skip_pretrain:
+            raise ValueError(
+                "--skip-pretrain conflicts with a pretrain resume checkpoint"
+            )
+        print(f"Resume: {args.resume} (Phase: {resume_phase})")
+    else:
+        from .modeling.model import EconomyEncoder
 
-    vocab = tokenizer.vocab
-    model = EconomyEncoder(
-        vocab_size=tokenizer.vocab_size,
-        max_seq_len=config.max_seq_len,
-        pad_idx=vocab.get("[pad]", 0),
-        cls_idx=vocab.get("[cls]", 1),
-        sep_idx=vocab.get("[sep]", 2),
-    )
+        vocab = tokenizer.vocab
+        model = EconomyEncoder(
+            vocab_size=tokenizer.vocab_size,
+            max_seq_len=config.max_seq_len,
+            pad_idx=vocab.get("[pad]", 0),
+            cls_idx=vocab.get("[cls]", 1),
+            sep_idx=vocab.get("[sep]", 2),
+        )
     params = sum(p.numel() for p in model.parameters())
     print(f"Parameter: {params/1e6:.2f}M")
     print()
 
-    def save_periodic_checkpoint(phase: str, completed_epochs: int) -> None:
+    def save_periodic_checkpoint(
+        phase: str,
+        completed_epochs: int,
+        training_state: dict[str, object],
+    ) -> None:
         path = _periodic_checkpoint_path(
             args.output,
             phase=phase,
             completed_epochs=completed_epochs,
         )
-        save_checkpoint(model, tokenizer, config, path)
+        save_checkpoint(
+            model,
+            tokenizer,
+            config,
+            path,
+            training_state=training_state,
+        )
+        removed = _prune_periodic_checkpoints(
+            args.output,
+            phase=phase,
+            keep=args.keep_checkpoints,
+        )
         print(
             "Zwischencheckpoint: "
             f"{path} (Phase: {phase}, abgeschlossene Epochen: {completed_epochs})"
         )
+        if removed:
+            print(
+                "Checkpoint-Aufbewahrung: entfernt "
+                + ", ".join(item.name for item in removed)
+            )
 
-    if not args.skip_pretrain:
+    def save_best_checkpoint(completed_epoch: int, validation_mae: float) -> None:
+        path = args.output.with_suffix(".checkpoints") / "best.pt"
+        save_checkpoint(model, tokenizer, config, path)
+        print(
+            "Bester Checkpoint: "
+            f"{path} (Epoche: {completed_epoch}, MAE: {validation_mae:.4f})"
+        )
+
+
+    if not args.skip_pretrain and resume_phase != "score":
         print("=== 4. Pretraining (MLM) ===")
         t0 = time.time()
         pretrain(
@@ -356,24 +517,39 @@ def _run_train(args) -> int:
             config,
             device=device,
             checkpoint_every_epochs=args.checkpoint_every,
-            checkpoint_callback=save_periodic_checkpoint,
+            resume_checkpoint_callback=save_periodic_checkpoint,
+            resume_state=(
+                resume_state if resume_phase == "pretrain" else None
+            ),
         )
         print(f"Pretraining: {time.time()-t0:.1f}s")
         print()
 
     print("=== 5. Score-Training ===")
     t0 = time.time()
-    train_scores(
+    training_result = train_scores(
         model,
         train_examples,
         tokenizer,
         config,
         device=device,
         checkpoint_every_epochs=args.checkpoint_every,
-        checkpoint_callback=save_periodic_checkpoint,
+        resume_checkpoint_callback=save_periodic_checkpoint,
+        resume_state=resume_state if resume_phase == "score" else None,
+        validation_examples=val_examples,
+        early_stopping_patience=args.early_stopping_patience,
+        early_stopping_min_delta=args.early_stopping_min_delta,
+        evaluation_batch_size=args.batch_size,
+        best_checkpoint_callback=save_best_checkpoint if val_examples else None,
     )
     print(f"Score-Training: {time.time()-t0:.1f}s")
     print()
+    if training_result["best_epoch"] is not None:
+        print(
+            "Bestes Validierungsmodell: "
+            f"Epoche {training_result['best_epoch']}, "
+            f"MAE {training_result['best_mae']:.4f}"
+        )
 
     print("=== 6. Checkpoint ===")
     save_checkpoint(model, tokenizer, config, args.output)
@@ -388,6 +564,7 @@ def _run_train(args) -> int:
         summary_mode=config.summary_mode,
         iid_test_examples=iid_test_examples,
         ood_splits=ood_splits,
+        batch_size=args.batch_size,
     )
     return 0
 
@@ -426,6 +603,126 @@ def _predict_abs_error(model, tokenizer, example, device, *, summary_mode: str) 
         out = model(t, a)
     pred = out["score"].item()
     return abs(pred - _example_score(example))
+
+
+def _predict_examples(
+    model,
+    tokenizer,
+    examples,
+    device,
+    *,
+    summary_mode: str,
+    batch_size: int = 64,
+) -> tuple[list[object], list[float], list[float]]:
+    """Run one complete evaluation split through the batched predictor."""
+
+    from .pipeline import predict_scores
+
+    items = list(examples)
+    targets = [_example_score(example) for example in items]
+    predictions = predict_scores(
+        model,
+        items,
+        tokenizer,
+        max_seq_len=model.max_seq_len,
+        summary_mode=summary_mode,
+        batch_size=batch_size,
+        device=device,
+    )
+    if len(predictions) != len(items):
+        raise RuntimeError("prediction count does not match evaluation examples")
+    return items, targets, predictions
+
+
+def _print_score_metrics(
+    label: str,
+    targets: list[float],
+    predictions: list[float],
+) -> None:
+    """Print regression, direction and strong-impact metrics."""
+
+    from .metrics import compute_score_metrics
+
+    metrics = compute_score_metrics(targets, predictions)
+    strong = (
+        "--" if metrics.strong_mae is None else f"{metrics.strong_mae:.4f}"
+    )
+    print(
+        f"{label} MAE: {metrics.mae:.4f} | "
+        f"Richtung: {metrics.sign_accuracy:.1%} | "
+        f"Stark-MAE: {strong} (strong_n={metrics.strong_count}, n={metrics.count})"
+    )
+
+
+def _evaluation_dimensions(example, target: float) -> dict[str, str]:
+    """Return stable diagnostic slice labels for either training schema."""
+
+    event = getattr(example, "event", None)
+    mechanism = getattr(event, "mechanism", None) or getattr(
+        example, "event_type", "unknown"
+    )
+    direction = getattr(event, "direction", None) or getattr(
+        example, "direction", "unknown"
+    )
+    horizon_days = int(getattr(example, "horizon_days"))
+    if horizon_days <= 30:
+        horizon = "<=30d"
+    elif horizon_days <= 90:
+        horizon = "31-90d"
+    else:
+        horizon = ">90d"
+    absolute_target = abs(target)
+    if absolute_target <= 0.05:
+        impact = "neutral"
+    elif absolute_target < 0.5:
+        impact = "moderate"
+    else:
+        impact = "strong"
+
+    dimensions = {
+        "mechanism": str(mechanism),
+        "direction": str(direction),
+        "horizon": horizon,
+        "impact": impact,
+    }
+    metadata = getattr(example, "metadata", None)
+    if metadata is not None:
+        dimensions["source"] = str(getattr(metadata, "source", "unknown"))
+        dimensions["counterfactual"] = (
+            "variant"
+            if getattr(metadata, "counterfactual", None) is not None
+            else "base_or_standalone"
+        )
+    return dimensions
+
+
+def _print_evaluation_slices(
+    examples: list[object],
+    targets: list[float],
+    predictions: list[float],
+) -> None:
+    """Print metrics by mechanism, direction, horizon and impact band."""
+
+    from .metrics import compute_score_metrics
+
+    groups: dict[tuple[str, str], list[int]] = {}
+    for index, (example, target) in enumerate(zip(examples, targets)):
+        for dimension, value in _evaluation_dimensions(example, target).items():
+            groups.setdefault((dimension, value), []).append(index)
+    if not groups:
+        return
+
+    print("  Slices (* = n < 20):")
+    for (dimension, value), indices in sorted(groups.items()):
+        slice_metrics = compute_score_metrics(
+            (targets[index] for index in indices),
+            (predictions[index] for index in indices),
+        )
+        small = "*" if slice_metrics.count < 20 else " "
+        print(
+            f"  {small} {dimension}={value}: MAE={slice_metrics.mae:.4f}, "
+            f"Richtung={slice_metrics.sign_accuracy:.1%}, n={slice_metrics.count}"
+        )
 
 
 # Mapping from a frozen OOD split name to the predicate that identifies the
@@ -481,6 +778,7 @@ def _evaluate(
     summary_mode: str = SUMMARY_MODE_FULL,
     iid_test_examples: list | None = None,
     ood_splits: dict[str, tuple] | None = None,
+    batch_size: int = 64,
 ) -> None:
     import torch
 
@@ -489,16 +787,16 @@ def _evaluate(
 
     print("=== 7. Validation (IID) ===")
     if val_scenarios:
-        total_abs_err = 0.0
-        total_count = 0
-        for example in val_scenarios[:200]:
-            err = _predict_abs_error(
-                model, tokenizer, example, device, summary_mode=summary_mode
-            )
-            total_abs_err += err
-            total_count += 1
-        if total_count > 0:
-            print(f"IID MAE: {total_abs_err/total_count:.4f} (n={total_count})")
+        evaluated, targets, predictions = _predict_examples(
+            model,
+            tokenizer,
+            val_scenarios,
+            device,
+            summary_mode=summary_mode,
+            batch_size=batch_size,
+        )
+        _print_score_metrics("IID", targets, predictions)
+        _print_evaluation_slices(evaluated, targets, predictions)
     print()
 
     # IID test split is reported separately and never folded into the OOD
@@ -506,38 +804,41 @@ def _evaluate(
     # mode there is no held-out IID test slice and we simply skip the block.
     if iid_test_examples:
         print("=== 7b. Test (IID) ===")
-        total_abs_err = 0.0
-        total_count = 0
-        for example in iid_test_examples[:200]:
-            err = _predict_abs_error(
-                model, tokenizer, example, device, summary_mode=summary_mode
-            )
-            total_abs_err += err
-            total_count += 1
-        if total_count > 0:
-            print(f"Test IID MAE: {total_abs_err/total_count:.4f} (n={total_count})")
+        evaluated, targets, predictions = _predict_examples(
+            model,
+            tokenizer,
+            iid_test_examples,
+            device,
+            summary_mode=summary_mode,
+            batch_size=batch_size,
+        )
+        _print_score_metrics("Test IID", targets, predictions)
+        _print_evaluation_slices(evaluated, targets, predictions)
         print()
 
     print("=== 8. OOD-Tests ===")
-    by_category: dict[str, list[float]] = {}
+    by_category: dict[str, tuple[list[float], list[float]]] = {}
 
     if not ood_splits:
-        # Legacy mode: fall back to the synthetic OOD test suite.
+        # Legacy mode: batch the synthetic OOD suite by category.
         from .ood_tests import all_ood_tests
 
+        scenarios_by_category: dict[str, list[object]] = {}
         for test in all_ood_tests():
-            text = serialize_scenario(test.scenario, summary_mode=summary_mode)
-            token_ids = _encode_evaluation_text(model, tokenizer, text)
-            t = torch.tensor([token_ids], dtype=torch.long, device=device)
-            a = torch.ones_like(t)
-            with torch.inference_mode():
-                out = model(t, a)
-            pred = out["score"].item()
-            err = abs(pred - test.scenario.score)
             category = test.category
             if summary_mode == SUMMARY_MODE_NONE and category == "OOD_LANGUAGE":
                 category = "STRUCTURED_OOD (source: OOD_LANGUAGE)"
-            by_category.setdefault(category, []).append(err)
+            scenarios_by_category.setdefault(category, []).append(test.scenario)
+        for category, scenarios in scenarios_by_category.items():
+            _, targets, predictions = _predict_examples(
+                model,
+                tokenizer,
+                scenarios,
+                device,
+                summary_mode=summary_mode,
+                batch_size=batch_size,
+            )
+            by_category[category] = (targets, predictions)
 
         if summary_mode == SUMMARY_MODE_NONE:
             print(
@@ -545,10 +846,7 @@ def _evaluate(
                 "Ausgabe daher als STRUCTURED_OOD mit Quellkategorie OOD_LANGUAGE."
             )
     else:
-        # Frozen-dataset mode: evaluate each OOD split separately and filter
-        # the metric to the records that actually satisfy that split's OOD
-        # condition.  Family members held out only because of leakage control
-        # would otherwise dilute the OOD signal.
+        # Frozen splits are filtered to records satisfying the actual OOD rule.
         for split_name in (
             "test_entity_ood",
             "test_parameter_ood",
@@ -561,43 +859,55 @@ def _evaluate(
                 continue
             predicate = _ood_predicate_for_split(split_name, examples)
             metric_examples = (
-                examples if predicate is None
-                else tuple(r for r in examples if predicate(r))
+                examples
+                if predicate is None
+                else tuple(record for record in examples if predicate(record))
             )
             held_out_only = len(examples) - len(metric_examples)
-            errors: list[float] = []
-            for example in metric_examples:
-                errors.append(
-                    _predict_abs_error(
-                        model, tokenizer, example, device, summary_mode=summary_mode
-                    )
-                )
             label = split_name.upper()
             if held_out_only:
                 label = f"{label} (held-out-only: {held_out_only})"
-            if errors:
-                by_category[label] = errors
-            elif metric_examples:
-                # Empty errors list would drop the row; keep a zero-row visible
-                # only when there are metric examples but they produced no
-                # errors (impossible for abs).  This branch is defensive.
-                by_category[label] = errors
+            if metric_examples:
+                _, targets, predictions = _predict_examples(
+                    model,
+                    tokenizer,
+                    metric_examples,
+                    device,
+                    summary_mode=summary_mode,
+                    batch_size=batch_size,
+                )
+                by_category[label] = (targets, predictions)
 
-    print(f"{'Kategorie':40s} | {'MAE':>6s} | {'n':>3s}")
-    print("-" * 60)
-    total_err = 0.0
-    total_n = 0
-    for cat, errs in sorted(by_category.items()):
-        if not errs:
-            print(f"{cat:40s} | {'--':>6s} | {0:>3d}")
-            continue
-        mae = sum(errs) / len(errs)
-        print(f"{cat:40s} | {mae:.4f} | {len(errs)}")
-        total_err += sum(errs)
-        total_n += len(errs)
-    print("-" * 60)
-    if total_n:
-        print(f"{'OOD MAE':40s} | {total_err/total_n:.4f} | {total_n}")
+    from .metrics import compute_score_metrics
+
+    print(
+        f"{'Kategorie':45s} | {'MAE':>6s} | {'Richtung':>9s} | "
+        f"{'Stark-MAE':>9s} | {'n':>4s}"
+    )
+    print("-" * 86)
+    all_targets: list[float] = []
+    all_predictions: list[float] = []
+    for category, (targets, predictions) in sorted(by_category.items()):
+        metrics = compute_score_metrics(targets, predictions)
+        strong = (
+            "--" if metrics.strong_mae is None else f"{metrics.strong_mae:.4f}"
+        )
+        print(
+            f"{category:45s} | {metrics.mae:.4f} | "
+            f"{metrics.sign_accuracy:8.1%} | {strong:>9s} | {metrics.count:4d}"
+        )
+        all_targets.extend(targets)
+        all_predictions.extend(predictions)
+    print("-" * 86)
+    if all_targets:
+        metrics = compute_score_metrics(all_targets, all_predictions)
+        strong = (
+            "--" if metrics.strong_mae is None else f"{metrics.strong_mae:.4f}"
+        )
+        print(
+            f"{'OOD gesamt':45s} | {metrics.mae:.4f} | "
+            f"{metrics.sign_accuracy:8.1%} | {strong:>9s} | {metrics.count:4d}"
+        )
     print()
 
     if ood_splits:

@@ -15,14 +15,14 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from src.domain import (
+from .domain import (
     CanonicalEvent,
     CaseRef,
     ContextBundle,
     ContextFact,
     ProvenanceRecord,
 )
-from src.models.context_serializer import (
+from .modeling.context_serializer import (
     ContextSerializer,
     SUMMARY_MODE_FULL,
     normalize_summary_mode,
@@ -212,6 +212,9 @@ def record_to_context_bundle(
 
     if not isinstance(record, DatasetRecord):
         raise TypeError("record must be a DatasetRecord")
+    from .input_contract import validate_dataset_projection
+
+    validate_dataset_projection(record)
 
     if base_time is None:
         base_time = datetime(2026, 1, 1, 12, tzinfo=timezone.utc)
@@ -283,7 +286,7 @@ def _build_record_facts(record, case, observed_at):
     """Emit one ContextFact per supplied structural context factor.
 
     Every supplied factor is a normalized ratio in [0, 1]; we surface it as a
-    percent-valued fact so the model sees the same ``predicate=value;unit``
+    ratio-valued fact so the model sees the same ``predicate=value;unit``
     shape that production retrieval produces.
     """
 

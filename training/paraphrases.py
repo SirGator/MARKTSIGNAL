@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import random
 
-from src.models.context_serializer import NO_SUMMARY
+from .modeling.context_serializer import NO_SUMMARY
 
 from .scenarios import EconomicScenario
 
@@ -146,6 +146,49 @@ def expand_with_paraphrases(
 
     rng.shuffle(expanded)
     return expanded
+
+
+LEGACY_RUNTIME_NOISE_VERSION = "legacy-runtime-noise-v1"
+
+
+_RUNTIME_NOISE_TEMPLATES: tuple[str, ...] = (
+    "Market update: {text}. Further details may follow.",
+    "According to an initial report, {text}. The information remains subject to revision.",
+    "{text}. The article also discussed unrelated quarterly developments.",
+    "Breaking — {text}. Analysts are monitoring the situation.",
+    "{text} {text}",
+)
+
+
+def add_runtime_noise(
+    scenarios: list[EconomicScenario],
+    *,
+    ratio: float = 0.2,
+    seed: int = 42,
+) -> list[EconomicScenario]:
+    """Add article-like wording noise without changing structure or labels."""
+
+    if isinstance(ratio, bool) or not isinstance(ratio, (int, float)):
+        raise TypeError("ratio must be a number")
+    normalized_ratio = float(ratio)
+    if not 0.0 <= normalized_ratio <= 1.0:
+        raise ValueError("ratio must be between 0 and 1")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an integer")
+
+    rng = random.Random(seed)
+    noisy: list[EconomicScenario] = []
+    for scenario in scenarios:
+        if rng.random() >= normalized_ratio:
+            continue
+        template = rng.choice(_RUNTIME_NOISE_TEMPLATES)
+        noisy.append(
+            _clone_with_text(
+                scenario,
+                template.format(text=scenario.event_text),
+            )
+        )
+    return [*scenarios, *noisy]
 
 
 def _clone_with_text(scenario: EconomicScenario, new_text: str) -> EconomicScenario:

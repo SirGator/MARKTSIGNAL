@@ -5,7 +5,7 @@ try:
 except ModuleNotFoundError as exc:  # Optional ``ml`` dependency.
     raise unittest.SkipTest("model tests require PyTorch") from exc
 
-from src.models import EconomyEncoder
+from training.modeling.model import EconomyEncoder
 
 
 class EconomyEncoderTest(unittest.TestCase):

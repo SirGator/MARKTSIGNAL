@@ -10,26 +10,30 @@ from .schema import (
     CONTEXT_FACTOR_FIELDS,
     CounterfactualProvenance,
     DatasetRecord,
+    Event,
     Metadata,
 )
 
 
 DEFAULT_RATIO_GRID = (0.0, 0.25, 0.5, 0.75, 1.0)
 DEFAULT_MAGNITUDE_GRID = (0.1, 0.3, 0.5, 0.7, 0.9)
+DEFAULT_HORIZON_GRID = (7, 30, 90, 180, 365)
+_DEFAULT_DIRECTION_GRID = ("increase", "decrease")
 
 
 def generate_counterfactuals(
     base: DatasetRecord,
     *,
     varied_field: str,
-    values: Iterable[float],
+    values: Iterable,
     group_id: str | None = None,
 ) -> tuple[DatasetRecord, ...]:
     """Return variants that change exactly one causal input.
 
     ``varied_field`` may name an :class:`EconomicContext` ratio,
-    ``event.magnitude``, or ``horizon_days``.  Labels are always recomputed
-    through the canonical ``Event -> StateDelta -> Impact`` path.
+    ``event.magnitude``, ``event.direction``, or ``horizon_days``.  Labels
+    are always recomputed through the canonical
+    ``Event -> StateDelta -> Impact`` path.
     """
 
     if not isinstance(base, DatasetRecord):
@@ -37,7 +41,12 @@ def generate_counterfactuals(
     if not isinstance(varied_field, str) or not varied_field.strip():
         raise ValueError("varied_field must be a non-empty string")
     field_name = varied_field.strip()
-    allowed = {*CONTEXT_FACTOR_FIELDS, "event.magnitude", "horizon_days"}
+    allowed = {
+        *CONTEXT_FACTOR_FIELDS,
+        "event.magnitude",
+        "event.direction",
+        "horizon_days",
+    }
     if field_name not in allowed:
         raise ValueError(f"unsupported counterfactual field: {varied_field!r}")
 
@@ -56,6 +65,13 @@ def generate_counterfactuals(
         horizon_days = base.horizon_days
         if field_name == "event.magnitude":
             event = replace(event, magnitude=value)
+        elif field_name == "event.direction":
+            if value not in ("increase", "decrease"):
+                raise ValueError(
+                    "event.direction counterfactual values must be "
+                    "'increase' or 'decrease'"
+                )
+            event = replace(event, direction=value)
         elif field_name == "horizon_days":
             if isinstance(value, bool) or not isinstance(value, int):
                 raise TypeError("horizon_days counterfactual values must be integers")
@@ -98,29 +114,48 @@ def generate_counterfactuals(
 def standard_counterfactual_groups(
     base: DatasetRecord,
 ) -> dict[str, tuple[DatasetRecord, ...]]:
-    """Build standard grids for all declared causal inputs of one record."""
+    """Build standard grids for all declared causal inputs of one record.
+
+    Groups are mechanism-dependent by construction: every ratio the
+    mechanism actually declares (and therefore every ratio that can change
+    its label) is varied, plus ``event.magnitude``, ``event.direction`` and
+    ``horizon_days``.  Context factors the mechanism does not require are
+    never varied — that would produce label-invariant distractor groups
+    indistinguishable from real causal inputs.
+    """
 
     from .mechanisms import get_mechanism
 
     definition = get_mechanism(base.event.mechanism)
-    fields = (*definition.required_context_fields, "event.magnitude")
-    return {
-        field: generate_counterfactuals(
+    fields = (
+        *definition.required_context_fields,
+        "event.magnitude",
+        "event.direction",
+        "horizon_days",
+    )
+    groups: dict[str, tuple[DatasetRecord, ...]] = {}
+    for field in fields:
+        if field == "event.magnitude":
+            values: tuple = DEFAULT_MAGNITUDE_GRID
+        elif field == "event.direction":
+            values = _DEFAULT_DIRECTION_GRID
+        elif field == "horizon_days":
+            values = DEFAULT_HORIZON_GRID
+        else:
+            values = DEFAULT_RATIO_GRID
+        groups[field] = generate_counterfactuals(
             base,
             varied_field=field,
-            values=(
-                DEFAULT_MAGNITUDE_GRID
-                if field == "event.magnitude"
-                else DEFAULT_RATIO_GRID
-            ),
+            values=values,
         )
-        for field in fields
-    }
+    return groups
 
 
-def _input_value(record: DatasetRecord, field_name: str) -> float | int:
+def _input_value(record: DatasetRecord, field_name: str) -> float | int | str:
     if field_name == "event.magnitude":
         return record.event.magnitude
+    if field_name == "event.direction":
+        return record.event.direction
     if field_name == "horizon_days":
         return record.horizon_days
     value = getattr(record.context, field_name)
@@ -136,6 +171,7 @@ def _id_token(value: str) -> str:
 
 
 __all__ = [
+    "DEFAULT_HORIZON_GRID",
     "DEFAULT_MAGNITUDE_GRID",
     "DEFAULT_RATIO_GRID",
     "generate_counterfactuals",

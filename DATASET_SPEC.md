@@ -106,6 +106,13 @@ Event, Target, Horizon und alle anderen Kontextwerte bleiben gleich; danach
 werden StateDelta und Impact neu berechnet. Familien werden beim Splitten nie
 auseinandergerissen.
 
+Standardgruppen sind mechanismusabhängig: jede vom Mechanismus deklarierte
+Kontextgröße (und nur diese — nicht deklarierte Faktoren würden
+label-invariante Distraktorgruppen erzeugen), `event.magnitude`,
+`event.direction` und `horizon_days`. Der Richtungsspiegel erzeugt paarweise
+entgegengesetzte Labels und macht die Richtungssensitivität systematisch
+lernbar; die Horizontgruppe deckt den Zeitzerfall ab.
+
 ## Feste Splits
 
 Ein Export enthält immer:
@@ -154,8 +161,15 @@ python3 -m training train \
 
 Der Dataset-Record wird ohne Label-Leakage in ein produktives
 `ContextBundle` übersetzt und vom gleichen `ContextSerializer` wie bei der
-Inference serialisiert. Dataset-, Schema-, Generatorversion und Dataset-Seed
-werden im Checkpoint festgehalten.
+Inference serialisiert. Seit `context-serializer-v3` werden Facts
+(`predicate`, `subject`, `object`, `value`, `fact_id`) und historische
+Events (`occurred_at`, `event_id`) kanonisch sortiert, sodass die
+Tokenfolge unabhängig von der Lieferreihenfolge des Retrievals ist.
+Dataset-, Schema-, Generatorversion und Dataset-Seed werden im Checkpoint
+festgehalten; die Frozen-Record-Projektion wird zusätzlich durch einen
+Behavioral Fingerprint aus einer Probe-Suite über alle 15 Mechanismen,
+alle Kontextfaktoren, beide Units und beide Summary-Modes gesichert
+(`dataset-record-to-context-v2`).
 
 ## Geltungsgrenze
 

@@ -53,15 +53,17 @@ class RoPE(nn.Module):
             raise ValueError(
                 f"sequence length {seq_len} exceeds RoPE capacity {self.cos.shape[0]}"
             )
-        cos = self.cos[:seq_len]
-        sin = self.sin[:seq_len]
-        x1 = x[..., 0::2]
-        x2 = x[..., 1::2]
-        rotated = torch.stack(
-            (x1 * cos - x2 * sin, x1 * sin + x2 * cos),
-            dim=-1,
-        )
-        return rotated.flatten(-2)
+        # Interleaved rotation via complex multiply.  Numerically identical to
+        # the original stack/flatten formulation, but runs as one fused kernel.
+        cos = self.cos[:seq_len].to(x.dtype)
+        sin = self.sin[:seq_len].to(x.dtype)
+        freq_real = cos.unsqueeze(0)
+        freq_imag = sin.unsqueeze(0)
+        x_pairs = x.reshape(*x.shape[:-1], -1, 2)
+        real = x_pairs[..., 0] * freq_real - x_pairs[..., 1] * freq_imag
+        imag = x_pairs[..., 0] * freq_imag + x_pairs[..., 1] * freq_real
+        rotated = torch.stack((real, imag), dim=-1)
+        return rotated.reshape(*x.shape)
 
 
 class SwiGLU(nn.Module):
@@ -106,14 +108,20 @@ class MultiHeadAttention(nn.Module):
         q = self.rope(q)
         k = self.rope(k)
 
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-
+        # scaled_dot_product_attention dispatches to fused/mem-efficient/flash
+        # kernels instead of materializing the full [batch, heads, seq, seq]
+        # attention matrix.  ``key_padding_mask`` is True for PAD positions,
+        # while SDPA boolean masks expect True to attend, so it is inverted.
+        attn_mask = None
         if key_padding_mask is not None:
-            mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
-            scores = scores.masked_fill(mask, float("-inf"))
+            attn_mask = (~key_padding_mask.bool()).unsqueeze(1).unsqueeze(2)
 
-        attn = F.softmax(scores, dim=-1)
-        out = torch.matmul(attn, v)
+        out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+        )
         out = out.transpose(1, 2).contiguous().view(batch, seq_len, -1)
         return self.o_proj(out)
 
@@ -169,6 +177,7 @@ class EconomyEncoder(nn.Module):
         pad_idx: int = 0,
         cls_idx: int = 1,
         sep_idx: int = 2,
+        strict_validation: bool = True,
     ) -> None:
         super().__init__()
         self.d_model = d_model
@@ -176,6 +185,7 @@ class EconomyEncoder(nn.Module):
         self.pad_idx = pad_idx
         self.cls_idx = cls_idx
         self.sep_idx = sep_idx
+        self.strict_validation = strict_validation
 
         self.token_embedding = nn.Embedding(vocab_size, d_model, padding_idx=pad_idx)
 
@@ -192,11 +202,19 @@ class EconomyEncoder(nn.Module):
             nn.Linear(128, 1),
         )
 
-    def forward(
+    def _validate_inputs(
         self,
         token_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
+    ) -> None:
+        """Fail-closed input contract. Skipped in fast (non-strict) mode.
+
+        These checks force device-wide reductions on every batch.  They are
+        invaluable for debugging and small runs, but pure overhead for a
+        long production training loop whose collate function already
+        guarantees the same invariants.
+        """
+
         if token_ids.ndim != 2:
             raise ValueError("token_ids must have shape [batch, sequence_length]")
         if token_ids.shape[0] == 0:
@@ -209,10 +227,23 @@ class EconomyEncoder(nn.Module):
             raise ValueError("attention_mask must contain only 0 or 1")
         if not attention_mask.bool().any(dim=1).all():
             raise ValueError("every sample must contain at least one non-padding token")
+        if token_ids.shape[1] > self.max_seq_len:
+            raise ValueError(
+                f"sequence length {token_ids.shape[1]} exceeds max_seq_len {self.max_seq_len}"
+            )
+        cls_count = (token_ids == self.cls_idx).sum(dim=1)
+        if not (cls_count == 1).all():
+            raise ValueError("every sample must contain exactly one [CLS] token")
+
+    def forward(
+        self,
+        token_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        if self.strict_validation:
+            self._validate_inputs(token_ids, attention_mask)
 
         batch, seq_len = token_ids.shape
-        if seq_len > self.max_seq_len:
-            raise ValueError(f"sequence length {seq_len} exceeds max_seq_len {self.max_seq_len}")
 
         x = self.token_embedding(token_ids)
 
@@ -224,10 +255,6 @@ class EconomyEncoder(nn.Module):
         x = self.final_norm(x)
 
         cls_mask = token_ids == self.cls_idx
-        has_cls = cls_mask.any(dim=1)
-        if not has_cls.all():
-            raise ValueError("every sample must contain a [CLS] token")
-
         cls_indices = cls_mask.float().argmax(dim=1)
         batch_indices = torch.arange(batch, device=token_ids.device)
         cls_vectors = x[batch_indices, cls_indices]

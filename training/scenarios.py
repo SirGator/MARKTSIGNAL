@@ -1,4 +1,5 @@
-"""Parametric economic scenario generator (V2 — consistent text/label).
+"""
+Parametric economic scenario generator (V2 — consistent text/label).
 
 Every variable that influences the score is explicitly part of the input text.
 Every template has exactly one direction. Text and label can never contradict.
@@ -174,6 +175,20 @@ def _build_context(
 
     Context is built by (event_type, role) so that only variables that
     actually influence the score appear — no irrelevant features.
+
+    Deliberate distractors (documented contract, not an accident): a few
+    roles serialize a context variable that does NOT enter _compute_score
+    for that (event_type, role) combination:
+
+        - interest_rate_change/bank:      rate_sensitivity (pricing_power)
+        - export_restriction/competitor:  market_share_gain_potential
+                                          (pricing_power) and
+                                          substitution_barrier (substitution)
+
+    These teach the model to ignore economically irrelevant information
+    instead of latching onto any numeric field.  If they should become
+    label-relevant, they must be added to _compute_score — a change of
+    that contract requires regenerating scenario data and retraining.
     """
     if role == "neutral":
         return (

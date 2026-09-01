@@ -34,6 +34,15 @@ auf einen konkreten Case über einen festen Horizont.
 | Loss (Score)           | SmoothL1Loss     |
 | Parameter              | ca. 20-25 Mio.   |
 
+### Vokabulargroessen und Parameterzahl
+
+Die Referenzarchitektur oben nennt 24.000 Tokens (~23,4 Mio. Parameter).
+Die Trainings-CLI verwendet standardmaessig `--vocab-size 4000` und baut damit
+die kompakte Variante mit ~15,7 Mio. Parametern.  Beide Varianten nutzen
+dieselbe Architektur; der Unterschied liegt ausschliesslich in der
+Embedding-Matrix (24000 x 384 ≈ 9,2M vs. 4000 x 384 ≈ 1,5M).  Wer die
+Referenzgroesse trainieren will, setzt `--vocab-size 24000` explizit.
+
 ## Input-Format und Summary-Vertrag
 
 Ein Eingabebeispiel ist eine einzige, deterministisch serialisierte

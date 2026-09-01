@@ -1,18 +1,18 @@
 """MARKTSIGNAL training — offline, separate from the production system.
 
 This package contains everything needed to train EconomyEncoder V1:
-    - tokenizer.py:   BPE tokenizer (via src/models/tokenizer.py)
+    - modeling/:      training-local model, tokenizer and serialization code
     - scenarios.py:   parametric economic scenario generator
     - ood_tests.py:   out-of-distribution test data
     - data.py:        legacy template-based data (kept for compatibility)
-    - pipeline.py:    pretraining (MLM) and score training (SmoothL1Loss)
+    - pipeline.py:    pretraining, score training, checkpoints and resume
     - cli.py:         command-line entry point (python -m training train)
 
-The production system in src/ never imports from here. The only connection
+The runtime system never imports from here. The only connection
 between training and production is the saved checkpoint (.pt file).
 """
 
-from src.models.tokenizer import BPETokenizer
+from .modeling.tokenizer import BPETokenizer
 from .scenarios import EconomicScenario, generate_parametric, generate_counterexample_groups
 from .ood_tests import OODTest, all_ood_tests, ood_by_category
 from .data import (
@@ -31,8 +31,10 @@ _PIPELINE_EXPORTS = {
     "build_tokenizer",
     "pretrain",
     "train_scores",
+    "predict_scores",
     "save_checkpoint",
     "load_checkpoint",
+    "load_training_checkpoint",
 }
 
 
@@ -46,6 +48,7 @@ def __getattr__(name: str):
     value = getattr(import_module(".pipeline", __name__), name)
     globals()[name] = value
     return value
+
 
 __all__ = [
     "BPETokenizer",
@@ -65,7 +68,9 @@ __all__ = [
     "generate_training_examples",
     "load_checkpoint",
     "load_frozen_dataset_for_training",
+    "load_training_checkpoint",
     "ood_by_category",
+    "predict_scores",
     "pretrain",
     "save_checkpoint",
     "train_scores",

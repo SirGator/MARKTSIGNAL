@@ -277,12 +277,46 @@ class CounterfactualTests(unittest.TestCase):
         base = _base_record("input_cost_change")
         groups = standard_counterfactual_groups(base)
         definition = get_mechanism(base.event.mechanism)
-        expected = {*definition.required_context_fields, "event.magnitude"}
+        expected = {
+            *definition.required_context_fields,
+            "event.magnitude",
+            "event.direction",
+            "horizon_days",
+        }
         self.assertEqual(set(groups), expected)
         for field, variants in groups.items():
-            self.assertGreaterEqual(len(variants), 3, field)
+            self.assertGreaterEqual(len(variants), 2, field)
             for variant in variants:
                 require_valid_record(variant)
+
+    def test_direction_grid_mirrors_the_label_sign(self) -> None:
+        base = _base_record("input_cost_change", direction="increase")
+        variants = generate_counterfactuals(
+            base,
+            varied_field="event.direction",
+            values=("increase", "decrease"),
+        )
+        self.assertEqual({v.event.direction for v in variants}, {"increase", "decrease"})
+        mirrored = {
+            v.event.direction: v.economic_impact for v in variants
+        }
+        self.assertAlmostEqual(
+            mirrored["increase"],
+            -mirrored["decrease"],
+            places=9,
+        )
+
+    def test_horizon_grid_is_a_supported_counterfactual(self) -> None:
+        base = _base_record("input_cost_change")
+        variants = generate_counterfactuals(
+            base,
+            varied_field="horizon_days",
+            values=(7, 90, 365),
+        )
+        self.assertEqual({v.horizon_days for v in variants}, {7, 90, 365})
+        for variant in variants:
+            self.assertEqual(variant.event, base.event)
+            require_valid_record(variant)
 
 
 class SplitTests(unittest.TestCase):
@@ -600,7 +634,7 @@ class DatasetRecordBridgeTests(unittest.TestCase):
         self.assertIn("[SEP]", text)
 
     def test_record_no_summary_mode_replaces_summary(self) -> None:
-        from src.models.context_serializer import SUMMARY_MODE_NONE
+        from training.modeling.context_serializer import SUMMARY_MODE_NONE
         from training.bridge import serialize_record
 
         record = _base_record("demand_change", index=3)
@@ -620,7 +654,7 @@ class DatasetRecordBridgeTests(unittest.TestCase):
             if "torch" in str(exc).lower():
                 self.skipTest("pipeline serialization requires PyTorch")
             raise
-        from src.models.context_serializer import SUMMARY_MODE_FULL, SUMMARY_MODE_NONE
+        from training.modeling.context_serializer import SUMMARY_MODE_FULL, SUMMARY_MODE_NONE
 
         record = _base_record("supply_change", index=5)
         full = serialize_training_example(record, summary_mode=SUMMARY_MODE_FULL)

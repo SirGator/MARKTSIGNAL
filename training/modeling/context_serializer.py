@@ -13,25 +13,33 @@ Output format (single text sequence):
 The target company identity is masked as [CASE_ENTITY] so the model
 cannot memorize specific company names.
 
-This serializer is used by BOTH:
-    - production (src/models/context_serializer.py via ContextTensorEncoder)
-    - training (training/scenarios.py builds the same format)
+This serializer is training-local; its contract version is embedded in checkpoints.
 
-Training and production MUST use the same serialization format.
+The runtime validates this serializer version before loading a checkpoint.
 """
 
 from __future__ import annotations
 
 import re
 
-from src.domain import CanonicalEvent, CaseRef, ContextBundle, ContextFact
+from training.domain import CanonicalEvent, CaseRef, ContextBundle, ContextFact
 
 
 NO_SUMMARY = "[NO_SUMMARY]"
 SUMMARY_MODE_FULL = "full"
 SUMMARY_MODE_NONE = "none"
 SUMMARY_MODES = frozenset((SUMMARY_MODE_FULL, SUMMARY_MODE_NONE))
-SERIALIZER_CONTRACT_VERSION = "context-serializer-v2"
+SERIALIZER_CONTRACT_VERSION = "context-serializer-v3"
+# v2 checkpoints serialized facts/historical events in caller-supplied order.
+# v3 sorts both canonically so two semantically identical ContextBundles always
+# produce identical token sequences.  Reading v2 artifacts stays supported;
+# saving always writes the current version.
+_LEGACY_SERIALIZER_CONTRACT_VERSIONS = frozenset(
+    (
+        "context-serializer-v2",
+        SERIALIZER_CONTRACT_VERSION,
+    )
+)
 
 
 def normalize_summary_mode(value: str) -> str:
@@ -45,6 +53,27 @@ def normalize_summary_mode(value: str) -> str:
             f"summary_mode must be one of {sorted(SUMMARY_MODES)}, got {value!r}"
         )
     return normalized
+
+
+def _fact_sort_key(fact: ContextFact) -> tuple[str, ...]:
+    """Stable canonical order: predicate, subject, object, value, fact_id."""
+
+    return (
+        fact.predicate.casefold(),
+        fact.subject_id.casefold(),
+        ("" if fact.object_id is None else fact.object_id.casefold()),
+        ("" if fact.value is None else str(fact.value).casefold()),
+        fact.fact_id.casefold(),
+    )
+
+
+def _historical_event_sort_key(event: CanonicalEvent) -> tuple[object, ...]:
+    """Stable canonical order for retrieved historical comparisons."""
+
+    return (
+        event.occurred_at,
+        event.event_id.casefold(),
+    )
 
 
 class ContextSerializer:
@@ -83,9 +112,16 @@ class ContextSerializer:
         lines.append("[EVENT] " + self._event_text(context.event, context.case))
         lines.append("[CASE] " + self._case_text(context.case))
         lines.append("[HORIZON] " + self._clean(horizon))
-        for fact in context.facts:
+        # Canonical ordering makes serialization independent of the order in
+        # which the retriever delivered facts or historical events.  Two
+        # semantically identical ContextBundles produce identical token
+        # sequences (see SERIALIZER_CONTRACT_VERSION v3).
+        for fact in sorted(context.facts, key=_fact_sort_key):
             lines.append("[CONTEXT] " + self._fact_text(fact, context.case))
-        for hist in context.historical_events:
+        for hist in sorted(
+            context.historical_events,
+            key=_historical_event_sort_key,
+        ):
             lines.append("[HISTORICAL_EVENT] " + self._event_text(hist, context.case))
         lines.append("[SEP]")
 

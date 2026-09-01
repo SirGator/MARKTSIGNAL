@@ -11,6 +11,10 @@ class CheckpointCliTests(unittest.TestCase):
         args = _build_parser().parse_args(["train"])
 
         self.assertEqual(args.checkpoint_every, 1)
+        self.assertEqual(args.keep_checkpoints, 3)
+        self.assertEqual(args.early_stopping_patience, 3)
+        self.assertAlmostEqual(args.runtime_noise_ratio, 0.2)
+        self.assertIsNone(args.resume)
 
     def test_snapshot_path_keeps_final_output_unchanged(self) -> None:
         self.assertEqual(

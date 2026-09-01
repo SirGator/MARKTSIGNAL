@@ -1,35 +1,16 @@
-"""Production checkpoint loader for EconomyEncoder.
-
-This module lives in src/models/ so production never imports from training/.
-It loads a checkpoint and returns a ready-to-use ContextTensorEncoder +
-TorchEconomyModel pair.
-
-max_seq_len and summary_mode are read from the checkpoint and applied to the
-encoder so training and inference cannot silently use different contracts.
-Legacy checkpoints without summary_mode fail closed.  A verified legacy
-full-summary artifact can be loaded with an explicit override; legacy
-no-summary artifacts require retraining because their marker format differed.
-"""
+"""Training-local validation for the portable checkpoint format."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-import hmac
-from pathlib import Path
-from typing import TYPE_CHECKING
 
-from src.models.context_serializer import (
+from .context_serializer import (
+    _LEGACY_SERIALIZER_CONTRACT_VERSIONS,
     SERIALIZER_CONTRACT_VERSION,
     SUMMARY_MODE_FULL,
     SUMMARY_MODES,
-    ContextSerializer,
     normalize_summary_mode,
 )
-
-if TYPE_CHECKING:
-    from src.models.adapter import TorchEconomyModel
-    from src.models.context_encoder import ContextTensorEncoder
-    from src.models.tokenizer import BPETokenizer
 
 
 CHECKPOINT_FORMAT_VERSION = 2
@@ -103,7 +84,7 @@ def validate_checkpoint_metadata(
             "unsupported or missing checkpoint_format_version: "
             f"{format_version!r}"
         )
-    if serializer_version != SERIALIZER_CONTRACT_VERSION:
+    if serializer_version not in _LEGACY_SERIALIZER_CONTRACT_VERSIONS:
         raise ValueError(
             "unsupported or missing serializer_contract_version: "
             f"{serializer_version!r}"
@@ -176,102 +157,80 @@ def validate_checkpoint_sequence_length(config: Mapping[str, object]) -> int:
     return value
 
 
-def load_economy_model(
-    checkpoint_path: Path,
+TRAINING_STATE_VERSION = 1
+TRAINING_PHASES = frozenset(("pretrain", "score"))
+
+
+def training_state_from_checkpoint(
+    checkpoint: Mapping[str, object],
     *,
-    legacy_summary_mode: str | None = None,
-) -> tuple["TorchEconomyModel", "ContextTensorEncoder", "BPETokenizer"]:
-    """Load a checkpoint and return (model_adapter, encoder, tokenizer).
+    expected_phase: str | None = None,
+) -> dict[str, object]:
+    """Return a validated resumable state or reject inference-only artifacts."""
 
-    The returned ContextTensorEncoder uses the same max_seq_len and summary
-    contract as the checkpoint.  Model and feature-schema versions are also
-    checkpoint-authoritative.  ``legacy_summary_mode`` is consulted only for
-    checkpoints whose config predates the summary_mode field.  It must be
-    explicitly set to ``full`` for a verified legacy full-summary artifact.
-    """
-    # Keep torch-dependent imports inside the loader so serializer-only
-    # production code remains usable without the optional ML dependency.
-    import torch
-
-    from src.models.adapter import TorchEconomyModel
-    from src.models.context_encoder import ContextTensorEncoder
-    from src.models.model import EconomyEncoder
-    from src.models.tokenizer import BPETokenizer
-
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     if not isinstance(checkpoint, Mapping):
         raise TypeError("checkpoint must contain a mapping")
-    cfg = checkpoint["config"]
-    if not isinstance(cfg, Mapping):
-        raise TypeError("checkpoint config must be a mapping")
-    validate_checkpoint_metadata(checkpoint, cfg)
-    summary_mode = summary_mode_from_checkpoint_config(
-        cfg,
-        legacy_summary_mode=legacy_summary_mode,
-    )
-    is_v2 = "summary_mode" in cfg
-    max_seq_len = validate_checkpoint_sequence_length(cfg)
-    if is_v2:
-        validate_checkpoint_versions(cfg, summary_mode)
-    vocab = checkpoint["vocab"]
-    merges = [tuple(m) for m in checkpoint.get("merges", [])]
+    if checkpoint.get("training_state_version") != TRAINING_STATE_VERSION:
+        if "training_state" not in checkpoint:
+            raise ValueError("checkpoint is inference-only and cannot be resumed")
+        raise ValueError(
+            "unsupported or missing training_state_version: "
+            f"{checkpoint.get('training_state_version')!r}"
+        )
+    raw_state = checkpoint.get("training_state")
+    if not isinstance(raw_state, Mapping):
+        raise TypeError("checkpoint training_state must be a mapping")
+    state = dict(raw_state)
 
-    tokenizer = BPETokenizer(vocab=vocab, merges=merges)
-    tokenizer.validate_special_tokens(include_no_summary=is_v2)
-    validate_checkpoint_token_ids(cfg, tokenizer.vocab, require_explicit=is_v2)
-    if cfg.get("vocab_size") != tokenizer.vocab_size:
-        raise ValueError("checkpoint config.vocab_size does not match vocab")
-    expected_tokenizer_hash = cfg.get("tokenizer_hash")
-    if is_v2:
-        if not isinstance(expected_tokenizer_hash, str):
-            raise ValueError("V2 checkpoint config.tokenizer_hash is required")
-        if not hmac.compare_digest(expected_tokenizer_hash, tokenizer.fingerprint):
-            raise ValueError("checkpoint tokenizer_hash does not match vocab/merges")
+    phase = state.get("phase")
+    if phase not in TRAINING_PHASES:
+        raise ValueError(f"invalid training phase: {phase!r}")
+    if expected_phase is not None and phase != expected_phase:
+        raise ValueError(
+            f"training checkpoint phase {phase!r} does not match {expected_phase!r}"
+        )
+    for key in (
+        "completed_epochs",
+        "global_step",
+        "steps_per_epoch",
+        "target_epochs",
+    ):
+        value = state.get(key)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"training_state.{key} must be an integer")
+        minimum = 1 if key in {"steps_per_epoch", "target_epochs"} else 0
+        if value < minimum:
+            raise ValueError(f"training_state.{key} must be at least {minimum}")
+    if state["global_step"] != (
+        state["completed_epochs"] * state["steps_per_epoch"]
+    ):
+        raise ValueError(
+            "training_state.global_step does not match completed epochs"
+        )
+    if state["completed_epochs"] > state["target_epochs"]:
+        raise ValueError("training_state.completed_epochs exceeds target_epochs")
 
-    checkpoint_feature_schema_version = _configured_version(
-        cfg,
-        "feature_schema_version",
-    )
-    checkpoint_model_version = _configured_version(
-        cfg,
-        "model_version",
-    )
-    if not is_v2:
-        # The runtime now hashes the explicit summary contract.  Preserve the
-        # stored artifact identity while making that legacy execution path
-        # visible in every exported score.
-        checkpoint_feature_schema_version += "+legacy-summary-full-runtime-v2"
-        checkpoint_model_version += "+legacy-summary-full-runtime-v2"
+    for key in (
+        "optimizer_state",
+        "scheduler_state",
+        "rng_state",
+        "run_contract",
+        "phase_state",
+    ):
+        if not isinstance(state.get(key), Mapping):
+            raise TypeError(f"training_state.{key} must be a mapping")
+    if state.get("loader_generator_state") is None:
+        raise TypeError("training_state.loader_generator_state is required")
+    losses = state.get("losses")
+    if not isinstance(losses, list) or any(
+        isinstance(value, bool) or not isinstance(value, (int, float))
+        for value in losses
+    ):
+        raise TypeError("training_state.losses must be a list of numbers")
+    if phase == "pretrain" and "mlm_head_state" not in state["phase_state"]:
+        raise ValueError(
+            "pretrain training_state.phase_state.mlm_head_state is required"
+        )
+    return state
 
-    model = EconomyEncoder(
-        vocab_size=cfg["vocab_size"],
-        d_model=cfg["d_model"],
-        num_heads=cfg["num_heads"],
-        num_layers=cfg["num_layers"],
-        ff_dim=cfg["ff_dim"],
-        max_seq_len=max_seq_len,
-        dropout=cfg.get("dropout", 0.0),
-        pad_idx=cfg.get("pad_idx", vocab.get("[pad]", 0)),
-        cls_idx=cfg.get("cls_idx", vocab.get("[cls]", 1)),
-        sep_idx=cfg.get("sep_idx", vocab.get("[sep]", 2)),
-    )
-    model.load_state_dict(checkpoint["model_state"])
 
-    encoder = ContextTensorEncoder(
-        tokenizer=tokenizer,
-        feature_schema_version=checkpoint_feature_schema_version,
-        serializer=ContextSerializer(
-            summary_mode=summary_mode,
-            allow_no_summary_marker=is_v2,
-        ),
-        summary_mode=summary_mode,
-        max_seq_len=max_seq_len,
-    )
-
-    adapter = TorchEconomyModel(
-        model,
-        encoder,
-        model_version=checkpoint_model_version,
-    )
-
-    return adapter, encoder, tokenizer

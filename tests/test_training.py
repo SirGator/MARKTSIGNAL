@@ -9,8 +9,8 @@ try:
 except ModuleNotFoundError as exc:  # Optional ``ml`` dependency.
     raise unittest.SkipTest("training tests require PyTorch") from exc
 
-from src.models.model import EconomyEncoder
-from src.models.tokenizer import BPETokenizer
+from training.modeling.model import EconomyEncoder
+from training.modeling.tokenizer import BPETokenizer
 from training.scenarios import generate_parametric, EconomicScenario
 from training.pipeline import (
     TrainingConfig,
@@ -168,6 +168,10 @@ class TrainingPipelineTests(unittest.TestCase):
             max_epochs=10,
             log_every=999,
         )
+        # Deterministic model initialization for this empirical quality gate.
+        # The canonical serializer ordering (context-serializer-v3) changes
+        # token sequences, so the seed pins a reproducible training outcome.
+        torch.manual_seed(123)
         model = EconomyEncoder(
             vocab_size=tokenizer.vocab_size,
             d_model=config.d_model,

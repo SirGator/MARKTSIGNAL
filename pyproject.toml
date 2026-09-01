@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "marktsignal-core"
+name = "marktsignal-training"
 version = "0.1.0"
-description = "Context-aware economic impact scoring from unstructured information"
+description = "Offline training pipeline for the MARKTSIGNAL economic-impact model"
 requires-python = ">=3.11"
 dependencies = []
 
@@ -14,12 +14,23 @@ ml = ["torch>=2.2"]
 dev = ["pytest>=7"]
 
 [project.scripts]
-marktsignal = "src.__main__:main"
+marktsignal-train = "training.cli:main"
 marktsignal-dataset = "dataset.generate:main"
 
 [tool.setuptools.packages.find]
-include = ["src*", "training*", "dataset*"]
+include = ["training*", "dataset*"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = [
+    "tests/test_checkpoint_cli.py",
+    "tests/test_dataset.py",
+    "tests/test_input_contract.py",
+    "tests/test_model.py",
+    "tests/test_serialization_parity.py",
+    "tests/test_training.py",
+    "tests/test_training_hardening.py",
+    "tests/test_training_optimizations.py",
+    "tests/test_training_resume.py",
+    "tests/test_training_summary_mode.py",
+]
 pythonpath = ["."]

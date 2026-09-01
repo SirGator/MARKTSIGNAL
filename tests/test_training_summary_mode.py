@@ -11,9 +11,9 @@ try:
 except ModuleNotFoundError as exc:  # Optional ``ml`` dependency.
     raise unittest.SkipTest("training summary-mode tests require PyTorch") from exc
 
-from src.models.model import EconomyEncoder
-from src.models.context_serializer import SUMMARY_MODE_FULL, SUMMARY_MODE_NONE
-from src.models.tokenizer import BPETokenizer
+from training.modeling.model import EconomyEncoder
+from training.modeling.context_serializer import SUMMARY_MODE_FULL, SUMMARY_MODE_NONE
+from training.modeling.tokenizer import BPETokenizer
 from training.bridge import serialize_scenario
 from training.cli import (
     _build_parser,
@@ -49,13 +49,17 @@ class _RecordingTokenizer:
 class _ZeroModel:
     max_seq_len = 3
 
+    def __init__(self) -> None:
+        self.calls = 0
+
     def eval(self) -> "_ZeroModel":
         return self
 
     def __call__(self, token_ids, attention_mask):
+        self.calls += 1
         if token_ids.shape[1] > self.max_seq_len:
             raise AssertionError("evaluation input was not truncated")
-        return {"score": torch.tensor([0.0], device=token_ids.device)}
+        return {"score": torch.zeros((token_ids.shape[0], 1), device=token_ids.device)}
 
 
 class SummaryModeContractTests(unittest.TestCase):
@@ -164,6 +168,28 @@ class SummaryModeContractTests(unittest.TestCase):
         self.assertIn("STRUCTURED_OOD", output.getvalue())
         self.assertIn("Quellkategorie OOD_LANGUAGE", output.getvalue())
         self.assertEqual(scenario.event_text, generate_parametric(num=1, seed=31)[0].event_text)
+
+    def test_validation_is_complete_and_batched_beyond_200_examples(self) -> None:
+        scenario = generate_parametric(num=1, seed=37)[0]
+        examples = [scenario] * 201
+        tokenizer = _RecordingTokenizer()
+        model = _ZeroModel()
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            _evaluate(
+                model,
+                tokenizer,
+                examples,
+                torch.device("cpu"),
+                summary_mode=SUMMARY_MODE_FULL,
+                ood_splits={"test_entity_ood": ()},
+                batch_size=64,
+            )
+
+        self.assertEqual(len(tokenizer.texts), 201)
+        self.assertEqual(model.calls, 4)
+        self.assertIn("n=201", output.getvalue())
 
     def test_full_and_none_runs_keep_identical_expanded_samples(self) -> None:
         base = generate_parametric(num=8, seed=41)
